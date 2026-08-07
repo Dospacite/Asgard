@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+web/node_modules/
+web/dist/
+!internal/frontend/dist/
+internal/frontend/dist/*
+!internal/frontend/dist/index.html
+bin/
+build/
+data/
+*.db
+*.db-shm
+*.db-wal
+coverage.out
+.DS_Store
+*.log

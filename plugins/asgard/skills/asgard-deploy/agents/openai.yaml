@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy with Asgard"
+  short_description: "Deploy and operate projects safely via Asgard"
+  default_prompt: "Use $asgard-deploy to inspect and deploy this application to Asgard."

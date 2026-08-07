@@ -1,0 +1,80 @@
+name: asgard
+services:
+  traefik-config-init:
+    image: alpine:3.23
+    restart: "no"
+    network_mode: none
+    labels:
+      com.rousoftware.asgard.managed: "true"
+      com.rousoftware.asgard.system: control-plane
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        mkdir -p /data/traefik/dynamic
+        cp /config/control-plane.yml /data/traefik/dynamic/control-plane.yml
+        chmod 0644 /data/traefik/dynamic/control-plane.yml
+    volumes:
+      - ./dynamic/control-plane.yml:/config/control-plane.yml:ro
+      - asgard-data:/data
+    security_opt: [no-new-privileges:true]
+  traefik:
+    image: traefik:v3.6
+    restart: unless-stopped
+    labels:
+      com.rousoftware.asgard.managed: "true"
+      com.rousoftware.asgard.system: control-plane
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes:
+      - ./traefik.yaml:/etc/traefik/traefik.yml:ro
+      - asgard-data:/data:ro
+      - traefik-data:/letsencrypt
+    networks: [asgard-management, asgard-edge]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      traefik-config-init:
+        condition: service_completed_successfully
+  asgard:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: asgard-control-plane:local
+    restart: unless-stopped
+    labels:
+      com.rousoftware.asgard.managed: "true"
+      com.rousoftware.asgard.system: control-plane
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ASGARD_LISTEN_ADDR: :8080
+      ASGARD_DATA_DIR: /data
+      ASGARD_DATA_VOLUME: asgard-data
+      ASGARD_HELPER_IMAGE: asgard-control-plane:local
+      ASGARD_TRAEFIK_DYNAMIC_DIR: /data/traefik/dynamic
+      ASGARD_EDGE_NETWORK: asgard-edge
+      ASGARD_MANAGEMENT_NETWORK: asgard-management
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - asgard-data:/data
+    networks: [asgard-management, asgard-edge]
+    security_opt: [no-new-privileges:true]
+    depends_on: [traefik]
+networks:
+  asgard-management:
+    name: asgard-management
+  asgard-edge:
+    name: asgard-edge
+volumes:
+  asgard-data:
+    name: asgard-data
+  traefik-data:
+    name: asgard-traefik-data

@@ -1,0 +1,114 @@
+name: penpot
+
+services:
+  penpot-frontend:
+    image: penpotapp/frontend:2.16
+    restart: always
+    expose:
+      - 8080
+    volumes:
+      - penpot_assets:/opt/data/assets
+    depends_on:
+      - penpot-backend
+      - penpot-exporter
+      - penpot-mcp
+    environment:
+      PENPOT_FLAGS: disable-email-verification enable-log-emails enable-prepl-server enable-mcp
+      PENPOT_PUBLIC_URI: https://penpot.asgard.rousoftware.com
+      PENPOT_HTTP_SERVER_MAX_BODY_SIZE: "367001600"
+      PENPOT_HTTP_SERVER_MAX_MULTIPART_BODY_SIZE: "367001600"
+
+  penpot-backend:
+    image: penpotapp/backend:2.16
+    restart: always
+    volumes:
+      - penpot_assets:/opt/data/assets
+    depends_on:
+      - penpot-postgres
+      - penpot-valkey
+    environment:
+      PENPOT_FLAGS: disable-email-verification enable-log-emails enable-prepl-server enable-mcp
+      PENPOT_PUBLIC_URI: https://penpot.asgard.rousoftware.com
+      PENPOT_HTTP_SERVER_MAX_BODY_SIZE: "367001600"
+      PENPOT_HTTP_SERVER_MAX_MULTIPART_BODY_SIZE: "367001600"
+      PENPOT_SECRET_KEY: replace-at-deploy
+      PENPOT_DATABASE_URI: postgresql://penpot-postgres/penpot
+      PENPOT_DATABASE_USERNAME: penpot
+      PENPOT_DATABASE_PASSWORD: replace-at-deploy
+      PENPOT_REDIS_URI: redis://penpot-valkey/0
+      PENPOT_OBJECTS_STORAGE_BACKEND: fs
+      PENPOT_OBJECTS_STORAGE_FS_DIRECTORY: /opt/data/assets
+      PENPOT_TELEMETRY_ENABLED: "true"
+      PENPOT_TELEMETRY_REFERER: asgard-compose
+
+  penpot-mcp:
+    image: penpotapp/mcp:2.16
+    restart: always
+
+  penpot-exporter:
+    image: penpotapp/exporter:2.16
+    restart: always
+    depends_on:
+      - penpot-valkey
+    environment:
+      PENPOT_SECRET_KEY: replace-at-deploy
+      PENPOT_PUBLIC_URI: https://penpot.asgard.rousoftware.com
+      PENPOT_INTERNAL_URI: http://penpot-frontend:8080
+      PENPOT_REDIS_URI: redis://penpot-valkey/0
+
+  penpot-postgres:
+    image: postgres:15
+    restart: always
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U penpot]
+      interval: 2s
+      timeout: 10s
+      retries: 5
+      start_period: 2s
+    volumes:
+      - penpot_postgres_v15:/var/lib/postgresql/data
+    environment:
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_DB: penpot
+      POSTGRES_USER: penpot
+      POSTGRES_PASSWORD: replace-at-deploy
+
+  penpot-valkey:
+    image: valkey/valkey:8.1
+    restart: always
+    healthcheck:
+      test: [CMD-SHELL, valkey-cli ping | grep PONG]
+      interval: 1s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    environment:
+      VALKEY_EXTRA_FLAGS: --maxmemory 128mb --maxmemory-policy volatile-lfu
+
+volumes:
+  penpot_postgres_v15:
+  penpot_assets:
+
+x-asgard:
+  primary-service: penpot-frontend
+  services:
+    penpot-frontend:
+      role: web
+      public: true
+      port: 8080
+      health-path: /readyz
+    penpot-backend:
+      role: web
+      public: false
+    penpot-mcp:
+      role: worker
+      public: false
+    penpot-exporter:
+      role: worker
+      public: false
+    penpot-postgres:
+      role: stateful
+      public: false
+    penpot-valkey:
+      role: stateful
+      public: false

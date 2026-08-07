@@ -1,0 +1,7 @@
+import { useQuery } from '@tanstack/react-query'
+import { ScrollText } from 'lucide-react'
+import { api } from '../api'
+import { EmptyState, ErrorState, formatDate, PageHeader, Skeleton } from '../components/ui'
+
+type Event={id:number;actorType:string;actorId:string;action:string;targetType:string;targetId:string;summary:string;ip:string;createdAt:string}
+export default function AuditPage(){const query=useQuery({queryKey:['audit'],queryFn:()=>api.get<{items:Event[]}>('/audit?limit=250')});if(query.isPending)return <div className="page"><PageHeader title="Audit"/><Skeleton height={420}/></div>;if(query.isError)return <div className="page"><ErrorState error={query.error}/></div>;return <div className="page"><PageHeader eyebrow="ACCOUNTABILITY" title="Audit trail" description="Authentication, agent activity, configuration changes, deployments, backups, and destructive actions."/>{query.data.items.length===0?<EmptyState icon={<ScrollText/>} title="No events yet">Activity will be recorded here as you use Asgard.</EmptyState>:<section className="audit-list">{query.data.items.map(item=><article key={item.id}><span className={`actor actor--${item.actorType}`}>{item.actorType}</span><div><strong>{item.summary}</strong><p><code>{item.action}</code> on {item.targetType} {item.targetId?`· ${item.targetId.slice(0,8)}`:''}</p></div><span><time dateTime={item.createdAt}>{formatDate(item.createdAt)}</time><small>{item.ip}</small></span></article>)}</section>}</div>}

@@ -1,0 +1,24 @@
+http:
+  routers:
+    asgard-control:
+      rule: Host(`asgard.rousoftware.com`)
+      entryPoints: [websecure]
+      service: asgard-control
+      middlewares: [asgard-security]
+      tls:
+        certResolver: letsencrypt
+  services:
+    asgard-control:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://asgard:8080
+  middlewares:
+    asgard-security:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: strict-origin-when-cross-origin
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true

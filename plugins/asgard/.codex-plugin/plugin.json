@@ -1,0 +1,19 @@
+{
+  "name": "asgard",
+  "version": "0.2.0",
+  "description": "Deploy and operate small applications on an Asgard control plane.",
+  "author": {
+    "name": "Rousoftware"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Asgard",
+    "shortDescription": "Deploy and operate apps on your Asgard VPS.",
+    "longDescription": "Inspect projects, prepare deployment-ready Compose applications, create health-gated releases, manage private cross-project networks, monitor operations, roll back, and manage backups through Asgard's OAuth-protected MCP server.",
+    "developerName": "Rousoftware",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["Inspect my Asgard projects and summarize their health.", "Prepare this app and deploy it to Asgard.", "Monitor my latest Asgard deployment and roll back if unhealthy."]
+  },
+  "mcpServers": "./.mcp.json"
+}

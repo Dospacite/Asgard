@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop for Asgard"
+  short_description: "Prepare applications for reliable Asgard releases"
+  default_prompt: "Use $asgard-develop to make this application deployment-ready for Asgard."

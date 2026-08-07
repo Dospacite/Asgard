@@ -1,0 +1,16 @@
+services:
+  peer:
+    image: alpine:3.22
+    command:
+      - sh
+      - -c
+      - while true; do sleep 3600; done
+    restart: unless-stopped
+
+x-asgard:
+  primary-service: peer
+  services:
+    peer:
+      role: worker
+      public: false
+      health-path: /
