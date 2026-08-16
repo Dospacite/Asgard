@@ -20,6 +20,7 @@ import (
 	"github.com/rousoftware/asgard/internal/oauth"
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
@@ -55,17 +56,21 @@ func New(cfg config.Config) (*App, error) {
 	}
 	proxyGenerator := &proxy.Generator{Store: database, Dir: cfg.TraefikDynamicDir}
 	ops := operations.New(database, cfg.OperationWorkers)
-	deployer := &deploy.Deployer{Store: database, Docker: engine, Proxy: proxyGenerator, EdgeNetwork: cfg.EdgeNetwork}
+	deployer := &deploy.Deployer{Store: database, Docker: engine, Proxy: proxyGenerator, EdgeNetwork: cfg.EdgeNetwork, DataDir: cfg.DataDir, DataVolume: cfg.DataVolume}
 	ops.Register("deployment.create", deployer.Handle)
 	ops.Register("deployment.rollback", deployer.Handle)
 	backupManager := &backup.Manager{Store: database, Docker: engine, BackupsDir: cfg.BackupsDir, DataVolume: cfg.DataVolume, HelperImage: cfg.HelperImage}
 	ops.Register("backup.create", backupManager.HandleCreate)
 	ops.Register("backup.restore", backupManager.HandleRestore)
-	projectImporter := &importer.Importer{Store: database, ProjectsDir: cfg.ProjectsDir, Domain: cfg.Domain}
+	secretBox, err := secrets.LoadOrCreate(filepath.Join(cfg.DataDir, "keys", "secrets.key"))
+	if err != nil {
+		return fail(fmt.Errorf("load secret key: %w", err))
+	}
+	projectImporter := &importer.Importer{Store: database, ProjectsDir: cfg.ProjectsDir, DataDir: cfg.DataDir, Domain: cfg.Domain, Secrets: secretBox}
 	networkManager := &networking.Manager{Store: database, Docker: engine, EdgeNetwork: cfg.EdgeNetwork}
 	oauthServer := oauth.New(database, authService, cfg.PublicURL)
-	mcpServer := mcpserver.New(mcpserver.Dependencies{Config: cfg, Store: database, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator})
-	server := api.New(api.Dependencies{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, OAuth: oauthServer, MCP: mcpServer.Handler})
+	mcpServer := mcpserver.New(mcpserver.Dependencies{Config: cfg, Store: database, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, Secrets: secretBox})
+	server := api.New(api.Dependencies{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, OAuth: oauthServer, MCP: mcpServer.Handler, Secrets: secretBox})
 	collector := &dockerx.Collector{Engine: engine, Store: database, Interval: cfg.MetricsInterval}
 	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, collector: collector}, nil
 }

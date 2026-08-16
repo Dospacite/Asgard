@@ -1,6 +1,6 @@
 ---
 name: asgard-develop
-description: Prepare an application for reliable deployment on Asgard. Use when Codex needs to create or review a Dockerfile, safe Docker Compose file, health endpoint, runtime limits, graceful shutdown, structured logs, persistent volumes, environment configuration, or x-asgard routing metadata.
+description: Prepare an application for reliable deployment on Asgard. Use when creating or reviewing a Dockerfile, safe Docker Compose file, health endpoint, runtime limits, graceful shutdown, structured logs, persistent volumes, environment configuration, or x-asgard routing metadata.
 ---
 
 # Develop for Asgard
@@ -17,8 +17,8 @@ Identify processes, listening ports, build commands, runtime commands, stateful 
 - Listen on `0.0.0.0`, read the port from environment, and write logs to stdout/stderr.
 - Implement a lightweight HTTP health endpoint that verifies readiness without mutating state.
 - Handle SIGTERM, stop accepting work, and exit within the container grace period.
-- Put durable data in declared named volumes. Never bind the Docker socket, host paths, devices, host networking, or privileged mode.
-- Keep secrets out of Compose. Declare non-secret defaults explicitly and document every required value.
+- Put durable data in declared named volumes. Never bind the Docker socket, host paths outside the project, devices, host networking, or privileged mode. A path the project itself ships, such as `./config/app.json`, may be mounted read-only; Asgard serves it from the project's own imported source.
+- Keep secrets out of Compose. Declare non-secret defaults explicitly and document every required value. `env_file` is supported and its values sit underneath any inline `environment` entry, matching Compose precedence.
 - Make dependency URLs configurable. For a cross-project dependency, accept an internal URL such as `http://<project>--<service>:<container-port>` through environment rather than hard-coding a public hostname.
 - Do not publish a service merely to let another project call it. Use an Asgard shared network and private DNS alias at deployment time.
 

@@ -43,6 +43,7 @@ type RawService struct {
 	Build       any         `yaml:"build"`
 	Command     any         `yaml:"command"`
 	Environment any         `yaml:"environment"`
+	EnvFile     any         `yaml:"env_file"`
 	Ports       []any       `yaml:"ports"`
 	Expose      []any       `yaml:"expose"`
 	Volumes     []string    `yaml:"volumes"`
@@ -165,6 +166,30 @@ func Parse(data []byte, projectID, projectSlug, root string) (Document, Validati
 		if err != nil {
 			result.Errors = append(result.Errors, ValidationError{path + ".environment", err.Error()})
 		}
+		// env_file values are merged underneath the inline environment, which
+		// keeps Compose's precedence: an explicit `environment` entry wins.
+		if refs, refErr := parseEnvFiles(raw.EnvFile); refErr != nil {
+			result.Errors = append(result.Errors, ValidationError{path + ".env_file", refErr.Error()})
+		} else if len(refs) > 0 {
+			if root == "" {
+				result.Warnings = append(result.Warnings, ValidationError{path + ".env_file", "Referenced files are read from the project source; validation previews cannot resolve them."})
+			} else if fileEnv, loadErr := loadEnvFiles(refs, root); loadErr != nil {
+				result.Errors = append(result.Errors, ValidationError{path + ".env_file", loadErr.Error()})
+			} else {
+				merged := map[string]string{}
+				for key, value := range fileEnv {
+					merged[key] = value
+				}
+				for key, value := range env {
+					merged[key] = value
+				}
+				if envErr := ValidateEnvironment(merged); envErr != nil {
+					result.Errors = append(result.Errors, ValidationError{path + ".env_file", envErr.Error()})
+				} else {
+					env = merged
+				}
+			}
+		}
 		command, err := parseCommand(raw.Command)
 		if err != nil {
 			result.Errors = append(result.Errors, ValidationError{path + ".command", err.Error()})
@@ -177,11 +202,12 @@ func Parse(data []byte, projectID, projectSlug, root string) (Document, Validati
 		}
 		volumes := []string{}
 		for i, spec := range raw.Volumes {
-			if err := validateVolume(spec, doc.Volumes); err != nil {
+			resolved, err := resolveVolume(spec, projectSlug, root, doc.Volumes)
+			if err != nil {
 				result.Errors = append(result.Errors, ValidationError{fmt.Sprintf("%s.volumes.%d", path, i), err.Error()})
-			} else {
-				volumes = append(volumes, normalizeVolume(projectSlug, spec))
+				continue
 			}
+			volumes = append(volumes, resolved)
 		}
 		cfg := doc.Asgard.Services[name]
 		port := cfg.Port
@@ -239,7 +265,6 @@ func Parse(data []byte, projectID, projectSlug, root string) (Document, Validati
 	}
 	result.PrimaryService = primary
 	result.Valid = len(result.Errors) == 0
-	_ = root
 	return doc, result
 }
 
@@ -277,7 +302,7 @@ func serviceKeys(node *yaml.Node, result *ValidationResult) {
 		services := node.Content[i+1]
 		for j := 0; j+1 < len(services.Content); j += 2 {
 			name := services.Content[j].Value
-			validateKeys(services.Content[j+1], resultErrorCollector(result), []string{"image", "build", "command", "environment", "ports", "expose", "volumes", "depends_on", "healthcheck", "restart"}, "services."+name)
+			validateKeys(services.Content[j+1], resultErrorCollector(result), []string{"image", "build", "command", "environment", "env_file", "ports", "expose", "volumes", "depends_on", "healthcheck", "restart"}, "services."+name)
 		}
 	}
 }
@@ -383,30 +408,36 @@ func parseDependsOn(value any) []string {
 	return out
 }
 
-func validateVolume(spec string, declared map[string]any) error {
+// resolveVolume validates one Compose volume entry and returns its canonical
+// stored form: an Asgard-scoped named volume, or a project-relative mount.
+func resolveVolume(spec, slug, root string, declared map[string]any) (string, error) {
 	parts := strings.Split(spec, ":")
 	if len(parts) < 2 || len(parts) > 3 {
-		return errors.New("volume must be named-volume:/absolute/container/path[:ro]")
+		return "", errors.New("volume must be named-volume:/absolute/container/path[:ro] or ./project/path:/absolute/container/path[:ro]")
 	}
 	source, target := parts[0], parts[1]
-	if source == "" || strings.HasPrefix(source, "/") || strings.HasPrefix(source, ".") || strings.Contains(source, "\\") {
-		return errors.New("host bind mounts are not allowed; use a named volume")
-	}
-	if _, ok := declared[source]; !ok {
-		return fmt.Errorf("named volume %q is not declared", source)
+	if source == "" {
+		return "", errors.New("volume source is required")
 	}
 	if !filepath.IsAbs(target) {
-		return errors.New("container mount path must be absolute")
+		return "", errors.New("container mount path must be absolute")
 	}
 	if len(parts) == 3 && parts[2] != "ro" && parts[2] != "rw" {
-		return errors.New("only ro or rw volume mode is supported")
+		return "", errors.New("only ro or rw volume mode is supported")
 	}
-	return nil
-}
-func normalizeVolume(slug, spec string) string {
-	parts := strings.Split(spec, ":")
-	parts[0] = "asgard-" + slug + "-" + Slug(parts[0])
-	return strings.Join(parts, ":")
+	if isBindSource(source) || strings.HasPrefix(source, "~") {
+		normalized, err := normalizeProjectMount(source, root)
+		if err != nil {
+			return "", err
+		}
+		parts[0] = normalized
+		return strings.Join(parts, ":"), nil
+	}
+	if _, ok := declared[source]; !ok {
+		return "", fmt.Errorf("named volume %q is not declared", source)
+	}
+	parts[0] = "asgard-" + slug + "-" + Slug(source)
+	return strings.Join(parts, ":"), nil
 }
 
 func firstPort(ports, expose []any) int {
@@ -451,7 +482,75 @@ func IsPublicHTTPS(raw string) error {
 	if u.Port() != "" && u.Port() != "443" {
 		return errors.New("source URL must use the standard HTTPS port")
 	}
-	addresses, err := net.LookupIP(u.Hostname())
+	return checkPublicHost(u.Hostname())
+}
+
+// GitSource is a parsed, validated repository location. Credentials never live
+// in the URL; they are resolved separately from the credential store so the
+// secret stays out of process arguments, stored config, and audit records.
+type GitSource struct {
+	// Scheme is "https" or "ssh".
+	Scheme string
+	// URL is the exact location handed to git.
+	URL string
+	// Host is the resolved remote host.
+	Host string
+}
+
+var scpLikePattern = regexp.MustCompile(`^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(.+)$`)
+
+// ValidateGitSource accepts a public HTTPS repository, and additionally an SSH
+// repository when an SSH credential will be supplied. Hosts resolving to
+// private, loopback, or link-local addresses are refused in every case so an
+// import cannot be aimed at the host's own network.
+func ValidateGitSource(raw string, sshCredential bool) (GitSource, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 2048 {
+		return GitSource{}, errors.New("repository URL is required")
+	}
+	if match := scpLikePattern.FindStringSubmatch(raw); match != nil && !strings.Contains(raw, "://") {
+		if !sshCredential {
+			return GitSource{}, errors.New("scp-style SSH URLs require an SSH credential; select one or use an HTTPS URL")
+		}
+		if err := checkPublicHost(match[2]); err != nil {
+			return GitSource{}, err
+		}
+		return GitSource{Scheme: "ssh", URL: raw, Host: match[2]}, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return GitSource{}, errors.New("repository URL could not be parsed")
+	}
+	if u.User != nil {
+		return GitSource{}, errors.New("do not embed credentials in the URL; store them as an Asgard Git credential instead")
+	}
+	switch u.Scheme {
+	case "https":
+		if u.Port() != "" && u.Port() != "443" {
+			return GitSource{}, errors.New("HTTPS repositories must use the standard HTTPS port")
+		}
+	case "ssh":
+		if !sshCredential {
+			return GitSource{}, errors.New("ssh:// repositories require an SSH credential")
+		}
+	default:
+		return GitSource{}, errors.New("repository URL must use https:// or ssh://")
+	}
+	if err := checkPublicHost(u.Hostname()); err != nil {
+		return GitSource{}, err
+	}
+	return GitSource{Scheme: u.Scheme, URL: u.String(), Host: u.Hostname()}, nil
+}
+
+var hostnamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// ValidateHostname reports whether value is a bare DNS hostname.
+func ValidateHostname(value string) bool {
+	return len(value) <= 253 && hostnamePattern.MatchString(value)
+}
+
+func checkPublicHost(host string) error {
+	addresses, err := net.LookupIP(host)
 	if err != nil {
 		return fmt.Errorf("resolve source host: %w", err)
 	}

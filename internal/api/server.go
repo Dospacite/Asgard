@@ -24,6 +24,7 @@ import (
 	"github.com/rousoftware/asgard/internal/oauth"
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
@@ -38,6 +39,7 @@ type Dependencies struct {
 	Proxy      *proxy.Generator
 	OAuth      *oauth.Server
 	MCP        http.Handler
+	Secrets    *secrets.Box
 }
 type Server struct {
 	Dependencies
@@ -92,7 +94,11 @@ func (s *Server) routes() http.Handler {
 		r.Get("/projects", s.projects)
 		r.Post("/imports/git", s.importGit)
 		r.Post("/imports/image", s.importImage)
-		r.Post("/imports/zip", s.importZIP)
+		r.Post("/imports/archive", s.importArchive)
+		r.Post("/imports/zip", s.importArchive)
+		r.Get("/git-credentials", s.gitCredentials)
+		r.Post("/git-credentials", s.createGitCredential)
+		r.Delete("/git-credentials/{credentialID}", s.deleteGitCredential)
 		r.Route("/projects/{projectID}", func(r chi.Router) {
 			r.Get("/", s.project)
 			r.Patch("/", s.updateProject)

@@ -1,0 +1,12 @@
+{
+  "name": "asgard",
+  "version": "0.3.0",
+  "description": "Deploy and operate small applications on an Asgard control plane through its OAuth-protected MCP server.",
+  "author": {
+    "name": "Rousoftware"
+  },
+  "homepage": "https://asgard.rousoftware.com",
+  "keywords": ["deployment", "docker", "compose", "self-hosting", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

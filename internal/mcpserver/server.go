@@ -25,6 +25,7 @@ import (
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/projectsource"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
@@ -36,6 +37,7 @@ type Dependencies struct {
 	Operations *operations.Manager
 	Importer   *importer.Importer
 	Proxy      *proxy.Generator
+	Secrets    *secrets.Box
 }
 type Server struct {
 	Dependencies
@@ -74,12 +76,20 @@ type RollbackInput struct {
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 type GitImportInput struct {
-	Name        string `json:"name" jsonschema:"required,project display name"`
-	Slug        string `json:"slug" jsonschema:"required,DNS-safe project slug"`
-	Description string `json:"description,omitempty"`
-	URL         string `json:"url" jsonschema:"required,public HTTPS Git URL"`
-	Ref         string `json:"ref,omitempty"`
-	ComposePath string `json:"composePath,omitempty"`
+	Name         string `json:"name" jsonschema:"required,project display name"`
+	Slug         string `json:"slug" jsonschema:"required,DNS-safe project slug"`
+	Description  string `json:"description,omitempty"`
+	URL          string `json:"url" jsonschema:"required,HTTPS Git URL; also ssh:// or git@host:path when credentialId names an SSH credential"`
+	Ref          string `json:"ref,omitempty"`
+	CredentialID string `json:"credentialId,omitempty" jsonschema:"stored Git credential id or name; required for private repositories"`
+	ComposePath  string `json:"composePath,omitempty"`
+}
+type GitCredentialCreateInput struct {
+	Name     string `json:"name" jsonschema:"required,human-readable credential name"`
+	Kind     string `json:"kind" jsonschema:"required,token for HTTPS or ssh for a deploy key"`
+	Secret   string `json:"secret" jsonschema:"required,the access token or PEM-encoded private key; stored encrypted and never returned"`
+	Username string `json:"username,omitempty" jsonschema:"HTTPS username; defaults to x-access-token"`
+	Host     string `json:"host,omitempty" jsonschema:"optional bare hostname this credential belongs to, such as github.com"`
 }
 type ImageImportInput struct {
 	Name        string `json:"name" jsonschema:"required,project display name"`
@@ -262,7 +272,16 @@ func (s *Server) addTools() {
 	mcp.AddTool(s.MCP, readTool("networks_list", "List shared networks", "List Asgard-managed shared networks, attached services, aliases, live addresses, and Docker state."), s.networksList)
 	mcp.AddTool(s.MCP, readTool("network_topology_get", "Get network topology", "Return public-edge, project-private, and shared-network nodes with every service connection."), s.networkTopology)
 
-	mcp.AddTool(s.MCP, writeTool("project_import_git", "Import public Git project", "Clone a public HTTPS repository, validate its safe Compose file, and create a project.", false, false, true), s.importGit)
+	mcp.AddTool(s.MCP, writeTool("project_import_git", "Import Git project", "Clone an HTTPS or SSH repository, validate its safe Compose file, and create a project. Pass credentialId to reach a private repository.", false, false, true), s.importGit)
+	mcp.AddTool(s.MCP, readTool("git_credentials_list", "List Git credentials", "List stored Git credentials by name, kind, and host. Secrets are never returned."), func(ctx context.Context, _ *mcp.CallToolRequest, _ Empty) (*mcp.CallToolResult, any, error) {
+		if err := require(ctx, "asgard:read"); err != nil {
+			return nil, nil, err
+		}
+		items, err := s.Store.ListGitCredentials(ctx)
+		return nil, map[string]any{"items": items}, err
+	})
+	mcp.AddTool(s.MCP, writeTool("git_credential_create", "Store a Git credential", "Encrypt and store an access token or SSH deploy key so private repositories can be imported. The secret is write-only.", false, false, false), s.createGitCredential)
+	mcp.AddTool(s.MCP, writeTool("git_credential_delete", "Delete a Git credential", "Remove a stored Git credential. Projects already imported with it keep their source.", true, true, false), s.deleteGitCredential)
 	mcp.AddTool(s.MCP, writeTool("project_import_image", "Import public OCI image", "Create a project from a public OCI image or Docker Hub URL.", false, false, true), s.importImage)
 	mcp.AddTool(s.MCP, writeTool("project_source_update", "Update project source file", "Revision-check, validate, and replace one editable Compose, Dockerfile, or .env file. Compose saves reconcile source-owned service fields while preserving runtime overrides.", true, false, false), s.updateProjectSource)
 	mcp.AddTool(s.MCP, writeTool("deployment_create", "Deploy project", "Queue an idempotent, health-gated versioned deployment and return its operation.", true, false, true), s.deploy)
@@ -394,12 +413,57 @@ func (s *Server) importGit(ctx context.Context, _ *mcp.CallToolRequest, in GitIm
 	if err := require(ctx, "asgard:deploy"); err != nil {
 		return nil, nil, err
 	}
-	project, result, err := s.Importer.FromGit(ctx, importer.Request{Name: in.Name, Slug: in.Slug, Description: in.Description, URL: in.URL, Ref: in.Ref, ComposePath: in.ComposePath})
+	project, result, err := s.Importer.FromGit(ctx, importer.Request{Name: in.Name, Slug: in.Slug, Description: in.Description, URL: in.URL, Ref: in.Ref, CredentialID: in.CredentialID, ComposePath: in.ComposePath})
 	if err == nil {
-		audit(ctx, s.Store, "project.import.git", "project", project.ID, "Agent imported public Git project")
+		visibility := "public"
+		if in.CredentialID != "" {
+			visibility = "private"
+		}
+		audit(ctx, s.Store, "project.import.git", "project", project.ID, "Agent imported "+visibility+" Git project")
 	}
 	return nil, map[string]any{"project": project, "validation": result}, err
 }
+func (s *Server) createGitCredential(ctx context.Context, _ *mcp.CallToolRequest, in GitCredentialCreateInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:configure"); err != nil {
+		return nil, nil, err
+	}
+	if s.Secrets == nil {
+		return nil, nil, errors.New("credential storage is unavailable")
+	}
+	item, secret, err := store.NormalizeGitCredential(in.Name, in.Kind, in.Username, in.Host, in.Secret)
+	if err != nil {
+		return nil, nil, err
+	}
+	ciphertext, nonce, err := s.Secrets.Seal(secret)
+	if err != nil {
+		return nil, nil, err
+	}
+	created, err := s.Store.CreateGitCredential(ctx, item, ciphertext, nonce)
+	if err == nil {
+		audit(ctx, s.Store, "git_credential.create", "git_credential", created.ID, "Agent stored "+created.Kind+" credential "+created.Name)
+	}
+	return nil, created, err
+}
+
+func (s *Server) deleteGitCredential(ctx context.Context, _ *mcp.CallToolRequest, in IDInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:configure"); err != nil {
+		return nil, nil, err
+	}
+	item, err := s.Store.GetGitCredential(ctx, in.ID)
+	if err != nil {
+		return nil, nil, errors.New("git credential not found")
+	}
+	projects, err := s.Store.ProjectsUsingGitCredential(ctx, item.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = s.Store.DeleteGitCredential(ctx, item.ID); err != nil {
+		return nil, nil, err
+	}
+	audit(ctx, s.Store, "git_credential.delete", "git_credential", item.ID, "Agent deleted credential "+item.Name)
+	return nil, map[string]any{"deleted": item.ID, "name": item.Name, "unlinkedProjects": projects}, nil
+}
+
 func (s *Server) importImage(ctx context.Context, _ *mcp.CallToolRequest, in ImageImportInput) (*mcp.CallToolResult, any, error) {
 	if err := require(ctx, "asgard:deploy"); err != nil {
 		return nil, nil, err

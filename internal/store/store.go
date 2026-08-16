@@ -36,27 +36,72 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.DB.Close() }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	_, err := s.DB.ExecContext(ctx, schema)
-	return err
+	if _, err := s.DB.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	for _, item := range addedColumns {
+		exists, err := s.columnExists(ctx, item.table, item.column)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.DB.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", item.table, item.column, item.definition)); err != nil {
+			return fmt.Errorf("add %s.%s: %w", item.table, item.column, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) columnExists(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.DB.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var index int
+		var name, columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&index, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+// IsNamedVolumeSpec reports whether a stored volume spec refers to a Docker
+// named volume. Project-relative mounts are served from Asgard's data volume
+// and must never be registered as backup-eligible named volumes of their own.
+func IsNamedVolumeSpec(spec string) bool {
+	source, _, found := strings.Cut(spec, ":")
+	return found && source != "" && !strings.HasPrefix(source, "@") && !strings.HasPrefix(source, "/") && !strings.HasPrefix(source, ".")
+}
+
 type Project struct {
-	ID             string    `json:"id"`
-	Slug           string    `json:"slug"`
-	Name           string    `json:"name"`
-	Description    string    `json:"description"`
-	SourceType     string    `json:"sourceType"`
-	SourceURL      string    `json:"sourceUrl"`
-	SourceRef      string    `json:"sourceRef"`
-	SourcePath     string    `json:"-"`
-	ComposePath    string    `json:"composePath"`
-	PrimaryService string    `json:"primaryService"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
-	Services       []Service `json:"services,omitempty"`
-	Status         string    `json:"status"`
+	ID                 string    `json:"id"`
+	Slug               string    `json:"slug"`
+	Name               string    `json:"name"`
+	Description        string    `json:"description"`
+	SourceType         string    `json:"sourceType"`
+	SourceURL          string    `json:"sourceUrl"`
+	SourceRef          string    `json:"sourceRef"`
+	SourceCredentialID string    `json:"sourceCredentialId,omitempty"`
+	SourcePath         string    `json:"-"`
+	ComposePath        string    `json:"composePath"`
+	PrimaryService     string    `json:"primaryService"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+	Services           []Service `json:"services,omitempty"`
+	Status             string    `json:"status"`
 }
 
 type Service struct {
@@ -173,7 +218,7 @@ func parseTimePtr(raw sql.NullString) *time.Time {
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_path,compose_path,primary_service,created_at,updated_at FROM projects ORDER BY updated_at DESC`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +226,7 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 	for rows.Next() {
 		var p Project
 		var created, updated string
-		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated); err != nil {
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -208,8 +253,8 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 func (s *Store) GetProject(ctx context.Context, idOrSlug string) (Project, error) {
 	var p Project
 	var created, updated string
-	err := s.DB.QueryRowContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_path,compose_path,primary_service,created_at,updated_at FROM projects WHERE id=? OR slug=?`, idOrSlug, idOrSlug).
-		Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated)
+	err := s.DB.QueryRowContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects WHERE id=? OR slug=?`, idOrSlug, idOrSlug).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated)
 	if err != nil {
 		return p, err
 	}
@@ -322,7 +367,7 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 	}
 	defer tx.Rollback()
 	now := Now()
-	_, err = tx.ExecContext(ctx, `INSERT INTO projects(id,slug,name,description,source_type,source_url,source_ref,source_path,compose_path,primary_service,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.Slug, p.Name, p.Description, p.SourceType, p.SourceURL, p.SourceRef, p.SourcePath, p.ComposePath, p.PrimaryService, now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO projects(id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.Slug, p.Name, p.Description, p.SourceType, p.SourceURL, p.SourceRef, p.SourceCredentialID, p.SourcePath, p.ComposePath, p.PrimaryService, now, now)
 	if err != nil {
 		return err
 	}
@@ -337,13 +382,10 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 		}
 		for _, spec := range svc.Volumes {
 			parts := strings.SplitN(spec, ":", 2)
-			if len(parts) != 2 {
+			if len(parts) != 2 || !IsNamedVolumeSpec(spec) {
 				continue
 			}
-			name := parts[0]
-			if !strings.HasPrefix(name, "/") && !strings.HasPrefix(name, ".") {
-				_, _ = tx.ExecContext(ctx, `INSERT OR IGNORE INTO volumes(id,project_id,service_id,name,mount_path,created_at) VALUES(lower(hex(randomblob(16))),?,?,?,?,?)`, p.ID, svc.ID, name, parts[1], now)
-			}
+			_, _ = tx.ExecContext(ctx, `INSERT OR IGNORE INTO volumes(id,project_id,service_id,name,mount_path,created_at) VALUES(lower(hex(randomblob(16))),?,?,?,?,?)`, p.ID, svc.ID, parts[0], parts[1], now)
 		}
 	}
 	return tx.Commit()
@@ -374,7 +416,7 @@ func (s *Store) AddService(ctx context.Context, svc Service) error {
 	}
 	for _, spec := range svc.Volumes {
 		parts := strings.Split(spec, ":")
-		if len(parts) >= 2 {
+		if len(parts) >= 2 && IsNamedVolumeSpec(spec) {
 			_, _ = s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO volumes(id,project_id,service_id,name,mount_path,created_at) VALUES(lower(hex(randomblob(16))),?,?,?,?,?)`, svc.ProjectID, svc.ID, parts[0], parts[1], now)
 		}
 	}

@@ -144,23 +144,23 @@ func (s *Server) importImage(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"project": project, "validation": result})
 }
 
-func (s *Server) importZIP(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, importer.MaxZIPCompressed+2<<20)
-	if err := r.ParseMultipartForm(importer.MaxZIPCompressed + 1<<20); err != nil {
-		httpx.Error(w, http.StatusRequestEntityTooLarge, "upload_too_large", "ZIP uploads are limited to 100 MiB.")
+func (s *Server) importArchive(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, importer.MaxArchiveCompressed+2<<20)
+	if err := r.ParseMultipartForm(importer.MaxArchiveCompressed + 1<<20); err != nil {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "upload_too_large", "Archive uploads are limited to 100 MiB.")
 		return
 	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "file_required", "A ZIP file is required.")
+		httpx.Error(w, http.StatusBadRequest, "file_required", "An archive file is required.")
 		return
 	}
 	defer file.Close()
-	if !strings.HasSuffix(strings.ToLower(header.Filename), ".zip") {
-		httpx.Error(w, http.StatusBadRequest, "invalid_file", "Upload a .zip archive.")
+	if !importer.HasArchiveExtension(header.Filename) {
+		httpx.Error(w, http.StatusBadRequest, "invalid_file", "Upload one of: "+strings.Join(importer.ArchiveExtensions, ", ")+".")
 		return
 	}
-	tmp, err := os.CreateTemp(filepath.Join(s.Config.DataDir, "uploads"), "upload-*.zip")
+	tmp, err := os.CreateTemp(filepath.Join(s.Config.DataDir, "uploads"), "upload-*.archive")
 	if err != nil {
 		writeError(w, err)
 		return
@@ -168,17 +168,17 @@ func (s *Server) importZIP(w http.ResponseWriter, r *http.Request) {
 	tmpPath := tmp.Name()
 	tmp.Close()
 	defer os.Remove(tmpPath)
-	if err := saveExisting(tmpPath, file, importer.MaxZIPCompressed); err != nil {
+	if err := saveExisting(tmpPath, file, importer.MaxArchiveCompressed); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid_upload", err.Error())
 		return
 	}
 	req := importer.Request{Name: r.FormValue("name"), Slug: r.FormValue("slug"), Description: r.FormValue("description"), ComposePath: r.FormValue("composePath")}
-	project, result, err := s.Importer.FromZIP(r.Context(), req, tmpPath)
+	project, result, err := s.Importer.FromArchive(r.Context(), req, tmpPath, header.Filename)
 	if err != nil {
 		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{"code": "import_failed", "message": err.Error(), "details": result}})
 		return
 	}
-	s.auditRequest(r, "project.import.zip", "project", project.ID, "Imported ZIP project")
+	s.auditRequest(r, "project.import.archive", "project", project.ID, "Imported "+project.SourceType+" archive project")
 	httpx.JSON(w, http.StatusCreated, map[string]any{"project": project, "validation": result})
 }
 

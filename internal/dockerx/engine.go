@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
+	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
@@ -540,6 +542,12 @@ type CreateRequest struct {
 	Image          string
 	ProjectNetwork string
 	EdgeNetwork    string
+	// DataVolume and SourceSubpath locate the project's imported source inside
+	// Asgard's own data volume. Project-relative mounts are served from there
+	// as volume subpaths, so a Compose file that mounts its own config or
+	// secret file works without ever exposing a host path to the workload.
+	DataVolume    string
+	SourceSubpath string
 }
 
 func (e *Engine) CreateServiceContainer(ctx context.Context, req CreateRequest) (Container, error) {
@@ -554,13 +562,9 @@ func (e *Engine) CreateServiceContainer(ctx context.Context, req CreateRequest) 
 		ports[network.MustParsePort(fmt.Sprintf("%d/tcp", req.Service.Port))] = struct{}{}
 	}
 	labels := map[string]string{LabelManaged: "true", "com.rousoftware.asgard.project-id": req.Project.ID, "com.rousoftware.asgard.project": req.Project.Slug, "com.rousoftware.asgard.service-id": req.Service.ID, "com.rousoftware.asgard.service": req.Service.Name, "com.rousoftware.asgard.release-id": req.ReleaseID, "com.rousoftware.asgard.version": strconv.Itoa(req.Version)}
-	mounts := []mount.Mount{}
-	for _, spec := range req.Service.Volumes {
-		parts := strings.Split(spec, ":")
-		if len(parts) >= 2 {
-			readOnly := len(parts) == 3 && parts[2] == "ro"
-			mounts = append(mounts, mount.Mount{Type: mount.TypeVolume, Source: parts[0], Target: parts[1], ReadOnly: readOnly})
-		}
+	mounts, err := buildMounts(req)
+	if err != nil {
+		return Container{}, err
 	}
 	pids := req.Service.PIDsLimit
 	initProcess := true
@@ -581,6 +585,28 @@ func (e *Engine) CreateServiceContainer(ctx context.Context, req CreateRequest) 
 		return Container{}, err
 	}
 	return e.Container(ctx, createResult.ID)
+}
+
+func buildMounts(req CreateRequest) ([]mount.Mount, error) {
+	mounts := []mount.Mount{}
+	for _, spec := range req.Service.Volumes {
+		parts := strings.Split(spec, ":")
+		if len(parts) < 2 {
+			continue
+		}
+		readOnly := len(parts) == 3 && parts[2] == "ro"
+		relative, isProjectMount := composecfg.ProjectMount(spec)
+		if !isProjectMount {
+			mounts = append(mounts, mount.Mount{Type: mount.TypeVolume, Source: parts[0], Target: parts[1], ReadOnly: readOnly})
+			continue
+		}
+		if req.DataVolume == "" || req.SourceSubpath == "" {
+			return nil, fmt.Errorf("service %s mounts %q from its project source, which requires the Asgard data volume", req.Service.Name, relative)
+		}
+		subpath := path.Join(req.SourceSubpath, relative)
+		mounts = append(mounts, mount.Mount{Type: mount.TypeVolume, Source: req.DataVolume, Target: parts[1], ReadOnly: readOnly, VolumeOptions: &mount.VolumeOptions{Subpath: subpath}})
+	}
+	return mounts, nil
 }
 
 func workloadCapabilities() []string {

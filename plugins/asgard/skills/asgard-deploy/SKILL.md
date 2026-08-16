@@ -1,6 +1,6 @@
 ---
 name: asgard-deploy
-description: Deploy, operate, monitor, roll back, back up, restore, or safely delete projects and containers through the Asgard MCP server. Use when Codex is asked to inspect Asgard state, import a project, create or watch a release, change runtime configuration, manage container lifecycle, or perform an exact confirmed deletion.
+description: Deploy, operate, monitor, roll back, back up, restore, or safely delete projects and containers through the Asgard MCP server. Use when asked to inspect Asgard state, import a project, create or watch a release, change runtime configuration, manage container lifecycle, or perform an exact confirmed deletion.
 ---
 
 # Deploy with Asgard
@@ -11,7 +11,7 @@ Use the Asgard MCP tools as the source of truth. Inspect before mutating.
 
 1. Call `system_get`, then `projects_list` or `project_get`. Confirm host capacity and current state.
 2. Before import, call `compose_contract_get`. Validate that the app uses only the declared safe subset.
-3. Import with `project_import_git` or `project_import_image`. Report validation errors exactly; do not weaken the contract.
+3. Import with `project_import_git` or `project_import_image`. For a private repository, call `git_credentials_list` and pass the matching `credentialId`; store a new one with `git_credential_create` only when the user supplies the secret. Never place a token or key in the repository URL. Report validation errors exactly; do not weaken the contract.
 4. For Compose, Dockerfile, or `.env` changes, call `project_source_get`, preserve the target file `revision`, and apply the smallest edit with `project_source_update`. Compose edits are validated against the safe contract and existing runtime overrides are preserved.
 5. Before runtime configuration changes, call `service_get` and preserve its `configRevision`. Choose a complete environment map and apply it with `service_config_update`; values shown in `.env` are candidates until explicitly selected for a service.
 6. Inspect `network_topology_get` before changing connectivity. Projects are isolated by default; create or reuse a shared network only for an explicit private dependency.
@@ -19,7 +19,8 @@ Use the Asgard MCP tools as the source of truth. Inspect before mutating.
 8. Verify both endpoints with `networks_list`. Use `network_reconcile` after a container replacement or unexpected disconnect; persisted memberships are also restored automatically during deployment and control-plane startup.
 9. Create deployments with a fresh stable idempotency key. Poll `operation_get` and `operation_logs_get` until a terminal state.
 10. If a release fails health gates, inspect its logs. Roll back only to a successful release and monitor the rollback operation to completion.
-11. Use the least OAuth scope that covers the work. Network and source changes require `asgard:configure`; never request delete access for ordinary deployment work.
+11. Archives (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`) are uploaded through the control-plane UI or `POST /api/v1/imports/archive`; there is no MCP upload tool, so direct the user there when the source is a local archive.
+12. Use the least OAuth scope that covers the work. Network and source changes require `asgard:configure`; never request delete access for ordinary deployment work.
 
 ## Network boundaries
 

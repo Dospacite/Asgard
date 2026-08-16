@@ -7,8 +7,9 @@ The production control plane is available at [asgard.rousoftware.com](https://as
 ## Included in the MVP
 
 - Single-administrator authentication with Argon2id passwords, Ed25519 JWTs, rotating refresh sessions, CSRF protection, and login throttling.
-- Project imports from ZIP files, public HTTPS Git repositories, and public OCI/Docker image references.
-- A constrained Compose contract with project/service configuration, CPU, memory, PID, restart, health, environment, volume, dependency, and routing settings.
+- Project imports from uploaded archives (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`), public and private Git repositories, and public OCI/Docker image references.
+- Encrypted, write-only Git credentials — HTTPS access tokens and SSH deploy keys — stored under a host-local AES-256-GCM key and used only during a clone.
+- A constrained Compose contract with project/service configuration, CPU, memory, PID, restart, health, environment, `env_file`, volume, dependency, and routing settings. Named volumes and project-relative paths may be mounted; host paths outside the project remain rejected.
 - An in-browser source workspace for validated Compose, Dockerfile, and `.env` editing, plus per-service selection of reusable `.env` variables and explicit overrides.
 - Durable, idempotent deployments; versioned releases; health-gated traffic switching; rollbacks; operation progress and logs.
 - Live container CPU, memory, network, block I/O, PID, disk, host-capacity, log, and audit views.
@@ -16,9 +17,9 @@ The production control plane is available at [asgard.rousoftware.com](https://as
 - Project-isolated bridges by default, plus explicit managed shared networks with stable private DNS aliases, live endpoint reconciliation, and network-, project-, and endpoint-centric topology dashboards.
 - Named-volume backups/restores and guarded project/container deletion. Project deletion retains named volumes but removes workload containers, source files, routes, and project networks.
 - OAuth 2.1 authorization-code flow with PKCE, dynamic client registration, resource-bound tokens, exact scopes, and a stateless MCP `2026-07-28` endpoint.
-- A Codex plugin with `asgard-deploy` and `asgard-develop` skills.
+- A plugin for Claude Code and Codex with `asgard-deploy` and `asgard-develop` skills.
 
-Private Git repositories, private registries, and signed Git redeploy webhooks are intentionally outside this single-user MVP.
+Private registries and signed Git redeploy webhooks are intentionally outside this single-user MVP.
 
 ## Local development
 
@@ -55,7 +56,14 @@ On the deployed VPS, the generated one-time password is root-readable at `/root/
 
 ## Agent access
 
-The MCP endpoint is `https://asgard.rousoftware.com/mcp`. Clients discover OAuth metadata at `/.well-known/oauth-protected-resource/mcp`, register dynamically, and ask the administrator to approve explicit Asgard scopes in the browser. Project source can be inspected and revision-safely updated with `project_source_get` and `project_source_update`; runtime environment selection remains available through `service_config_update`. The plugin manifest is under `plugins/asgard`, with its local marketplace entry in `.agents/plugins/marketplace.json`.
+The MCP endpoint is `https://asgard.rousoftware.com/mcp`. Clients discover OAuth metadata at `/.well-known/oauth-protected-resource/mcp`, register dynamically, and ask the administrator to approve explicit Asgard scopes in the browser. Project source can be inspected and revision-safely updated with `project_source_get` and `project_source_update`; runtime environment selection remains available through `service_config_update`. Private repositories are reached with `git_credentials_list`, `git_credential_create`, and the `credentialId` field of `project_import_git`.
+
+The plugin lives under `plugins/asgard` and carries both manifests: `.claude-plugin/plugin.json` for Claude Code and `.codex-plugin/plugin.json` for Codex. Marketplace entries are in `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json` respectively. Install it into Claude Code with:
+
+```sh
+claude plugin marketplace add /path/to/Asgard
+claude plugin install asgard@rousoftware
+```
 
 ## Validation
 

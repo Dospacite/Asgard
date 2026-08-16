@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/rousoftware/asgard/internal/dockerx"
 	"github.com/rousoftware/asgard/internal/proxy"
 	"github.com/rousoftware/asgard/internal/store"
@@ -24,7 +25,11 @@ type Deployer struct {
 	Docker      *dockerx.Engine
 	Proxy       *proxy.Generator
 	EdgeNetwork string
-	locks       sync.Map
+	// DataDir and DataVolume let project-relative mounts be resolved as
+	// subpaths of Asgard's own data volume rather than host paths.
+	DataDir    string
+	DataVolume string
+	locks      sync.Map
 }
 type Payload struct {
 	Trigger           string `json:"trigger"`
@@ -70,6 +75,10 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	}
 	if len(services) == 0 {
 		return errors.New("project has no services")
+	}
+	sourceSubpath, err := d.sourceSubpath(project)
+	if err != nil {
+		return err
 	}
 	for index := range services {
 		services[index].Networks, err = d.Store.ListServiceNetworks(ctx, services[index].ID)
@@ -119,6 +128,9 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	}
 	for _, svc := range services {
 		for _, spec := range svc.Volumes {
+			if _, isProjectMount := composecfg.ProjectMount(spec); isProjectMount {
+				continue
+			}
 			parts := strings.Split(spec, ":")
 			if len(parts) >= 2 {
 				if err = d.Docker.EnsureVolume(ctx, parts[0], map[string]string{dockerx.LabelManaged: "true", "com.rousoftware.asgard.project-id": project.ID, "com.rousoftware.asgard.service-id": svc.ID}); err != nil {
@@ -185,7 +197,7 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 			}
 			stoppedOld = append(stoppedOld, old[svc.ID].DockerID)
 		}
-		candidate, err := d.Docker.CreateServiceContainer(ctx, dockerx.CreateRequest{Project: project, Service: svc, ReleaseID: release.ID, Version: release.Version, Image: imageRef, ProjectNetwork: projectNetwork, EdgeNetwork: d.EdgeNetwork})
+		candidate, err := d.Docker.CreateServiceContainer(ctx, dockerx.CreateRequest{Project: project, Service: svc, ReleaseID: release.ID, Version: release.Version, Image: imageRef, ProjectNetwork: projectNetwork, EdgeNetwork: d.EdgeNetwork, DataVolume: d.DataVolume, SourceSubpath: sourceSubpath})
 		if err != nil {
 			return fmt.Errorf("create %s: %w", svc.Name, err)
 		}
@@ -223,6 +235,19 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	progress(100, fmt.Sprintf("Release r%d is live", release.Version))
 	succeeded = true
 	return nil
+}
+
+// sourceSubpath expresses a project's source directory relative to the data
+// directory, which is exactly its path inside the mounted data volume.
+func (d *Deployer) sourceSubpath(project store.Project) (string, error) {
+	if d.DataDir == "" || project.SourcePath == "" {
+		return "", nil
+	}
+	relative, err := filepath.Rel(d.DataDir, project.SourcePath)
+	if err != nil || strings.HasPrefix(relative, "..") {
+		return "", fmt.Errorf("project source %s is outside the Asgard data directory", project.SourcePath)
+	}
+	return filepath.ToSlash(relative), nil
 }
 
 func stopPriorBeforeCandidate(svc store.Service) bool {

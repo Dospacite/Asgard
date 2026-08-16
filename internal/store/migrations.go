@@ -319,6 +319,20 @@ CREATE TABLE IF NOT EXISTS adoption_snapshots (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS git_credentials (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    kind TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    hint TEXT NOT NULL DEFAULT '',
+    ciphertext BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS webhooks (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -328,5 +342,11 @@ CREATE TABLE IF NOT EXISTS webhooks (
     created_at TEXT NOT NULL
 );
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 `
+
+// addedColumns are applied to databases created before the column existed.
+// SQLite has no IF NOT EXISTS for ADD COLUMN, so each is probed first.
+var addedColumns = []struct{ table, column, definition string }{
+	{"projects", "source_credential_id", "TEXT NOT NULL DEFAULT ''"},
+}

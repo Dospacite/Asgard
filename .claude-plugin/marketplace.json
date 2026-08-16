@@ -1,0 +1,19 @@
+{
+  "name": "rousoftware",
+  "owner": {
+    "name": "Rousoftware"
+  },
+  "metadata": {
+    "description": "Rousoftware plugins for Claude Code.",
+    "version": "0.3.0"
+  },
+  "plugins": [
+    {
+      "name": "asgard",
+      "source": "./plugins/asgard",
+      "description": "Deploy and operate small applications on an Asgard control plane through its OAuth-protected MCP server.",
+      "category": "deployment",
+      "keywords": ["deployment", "docker", "compose", "self-hosting", "mcp"]
+    }
+  ]
+}

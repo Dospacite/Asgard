@@ -566,7 +566,7 @@ func updateComposedService(ctx context.Context, tx *sql.Tx, service store.Servic
 func syncVolumes(ctx context.Context, tx *sql.Tx, service store.Service, now string) error {
 	for _, spec := range service.Volumes {
 		parts := strings.SplitN(spec, ":", 3)
-		if len(parts) < 2 {
+		if len(parts) < 2 || !store.IsNamedVolumeSpec(spec) {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO volumes(id,project_id,service_id,name,mount_path,created_at) VALUES(?,?,?,?,?,?)`, uuid.NewString(), service.ProjectID, service.ID, parts[0], parts[1], now); err != nil {

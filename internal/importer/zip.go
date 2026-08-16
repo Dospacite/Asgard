@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	MaxZIPCompressed = 100 << 20
-	MaxZIPExpanded   = 1 << 30
-	MaxZIPFiles      = 20_000
-	MaxZIPFile       = 250 << 20
+	MaxZIPCompressed = MaxArchiveCompressed
+	MaxZIPExpanded   = MaxArchiveExpanded
+	MaxZIPFiles      = MaxArchiveFiles
+	MaxZIPFile       = MaxArchiveFile
 )
 
 func ExtractZIP(source, target string) error {
@@ -95,8 +95,37 @@ func ExtractZIP(source, target string) error {
 	return nil
 }
 
+// flattenSingleRoot lifts the contents of a lone wrapper directory — the shape
+// `tar czf` and GitHub tarballs produce — up into the project root. Without it
+// a Compose `build: .` context would resolve to the empty root rather than the
+// application, and every editable source path would carry a throwaway prefix.
+func flattenSingleRoot(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 1 || !entries[0].IsDir() {
+		return err
+	}
+	for _, name := range composeFilenames {
+		if info, statErr := os.Stat(filepath.Join(root, name)); statErr == nil && !info.IsDir() {
+			return nil
+		}
+	}
+	nested := filepath.Join(root, entries[0].Name())
+	inner, err := os.ReadDir(nested)
+	if err != nil {
+		return err
+	}
+	for _, item := range inner {
+		if err := os.Rename(filepath.Join(nested, item.Name()), filepath.Join(root, item.Name())); err != nil {
+			return err
+		}
+	}
+	return os.Remove(nested)
+}
+
+var composeFilenames = []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+
 func FindCompose(root string) (string, error) {
-	for _, name := range []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"} {
+	for _, name := range composeFilenames {
 		if info, err := os.Stat(filepath.Join(root, name)); err == nil && !info.IsDir() {
 			return name, nil
 		}
@@ -104,7 +133,7 @@ func FindCompose(root string) (string, error) {
 	entries, err := os.ReadDir(root)
 	if err == nil && len(entries) == 1 && entries[0].IsDir() {
 		nested := filepath.Join(root, entries[0].Name())
-		for _, name := range []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"} {
+		for _, name := range composeFilenames {
 			if info, err := os.Stat(filepath.Join(nested, name)); err == nil && !info.IsDir() {
 				return filepath.Join(entries[0].Name(), name), nil
 			}

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,32 +13,47 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rousoftware/asgard/internal/composecfg"
+	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
 type Importer struct {
 	Store       *store.Store
 	ProjectsDir string
+	DataDir     string
 	Domain      string
+	Secrets     *secrets.Box
 }
 
 type Request struct {
-	Name        string `json:"name"`
-	Slug        string `json:"slug"`
-	Description string `json:"description"`
-	URL         string `json:"url"`
-	Ref         string `json:"ref"`
-	Image       string `json:"image"`
-	Port        int    `json:"port"`
-	Public      bool   `json:"public"`
-	ComposePath string `json:"composePath"`
+	Name         string `json:"name"`
+	Slug         string `json:"slug"`
+	Description  string `json:"description"`
+	URL          string `json:"url"`
+	Ref          string `json:"ref"`
+	CredentialID string `json:"credentialId"`
+	Image        string `json:"image"`
+	Port         int    `json:"port"`
+	Public       bool   `json:"public"`
+	ComposePath  string `json:"composePath"`
 }
 
+// FromGit clones a repository, optionally authenticating with a stored
+// credential so private repositories can be imported.
 func (i *Importer) FromGit(ctx context.Context, req Request) (store.Project, composecfg.ValidationResult, error) {
-	if err := composecfg.IsPublicHTTPS(req.URL); err != nil {
+	auth, err := i.resolveAuth(ctx, req.CredentialID)
+	if err != nil {
 		return store.Project{}, composecfg.ValidationResult{}, err
 	}
-	p, root, err := i.prepare(req, "git")
+	source, err := composecfg.ValidateGitSource(req.URL, auth != nil && auth.credential.Kind == store.GitCredentialSSH)
+	if err != nil {
+		return store.Project{}, composecfg.ValidationResult{}, err
+	}
+	sourceType := "git"
+	if auth != nil {
+		sourceType = "git-private"
+	}
+	p, root, err := i.prepare(req, sourceType)
 	if err != nil {
 		return p, composecfg.ValidationResult{}, err
 	}
@@ -49,22 +63,52 @@ func (i *Importer) FromGit(ctx context.Context, req Request) (store.Project, com
 			_ = os.RemoveAll(root)
 		}
 	}()
-	cloneCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	cloneCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	args := []string{"clone", "--depth", "1", "--single-branch", "--no-tags"}
-	if req.Ref != "" {
-		args = append(args, "--branch", req.Ref)
+	if err := i.clone(cloneCtx, source, req.Ref, root, auth); err != nil {
+		return p, composecfg.ValidationResult{}, err
 	}
-	args = append(args, "--", req.URL, root)
-	cmd := exec.CommandContext(cloneCtx, "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return p, composecfg.ValidationResult{}, fmt.Errorf("clone failed: %s", sanitizeOutput(output))
-	}
+	// The clone's git metadata can hold credential-bearing remotes and is never
+	// needed again; the deployer builds from the extracted working tree.
 	_ = os.RemoveAll(filepath.Join(root, ".git"))
-	p.SourceURL = req.URL
+	p.SourceURL = source.URL
 	p.SourceRef = req.Ref
+	if auth != nil {
+		p.SourceCredentialID = auth.credential.ID
+	}
+	result, err := i.finish(ctx, &p, root, req.ComposePath)
+	if err == nil {
+		ok = true
+		if auth != nil {
+			_ = i.Store.TouchGitCredential(ctx, auth.credential.ID)
+		}
+	}
+	return p, result, err
+}
+
+// FromArchive imports a project from any supported upload container. The
+// original filename is only a hint; the archive's own bytes decide the format.
+func (i *Importer) FromArchive(ctx context.Context, req Request, archivePath, filename string) (store.Project, composecfg.ValidationResult, error) {
+	format, err := DetectFormat(archivePath, filename)
+	if err != nil {
+		return store.Project{}, composecfg.ValidationResult{}, err
+	}
+	p, root, err := i.prepare(req, string(format))
+	if err != nil {
+		return p, composecfg.ValidationResult{}, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.RemoveAll(root)
+		}
+	}()
+	if err := ExtractArchive(archivePath, root, filename); err != nil {
+		return p, composecfg.ValidationResult{}, err
+	}
+	if err := flattenSingleRoot(root); err != nil {
+		return p, composecfg.ValidationResult{}, err
+	}
 	result, err := i.finish(ctx, &p, root, req.ComposePath)
 	if err == nil {
 		ok = true
@@ -73,24 +117,7 @@ func (i *Importer) FromGit(ctx context.Context, req Request) (store.Project, com
 }
 
 func (i *Importer) FromZIP(ctx context.Context, req Request, zipPath string) (store.Project, composecfg.ValidationResult, error) {
-	p, root, err := i.prepare(req, "zip")
-	if err != nil {
-		return p, composecfg.ValidationResult{}, err
-	}
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.RemoveAll(root)
-		}
-	}()
-	if err := ExtractZIP(zipPath, root); err != nil {
-		return p, composecfg.ValidationResult{}, err
-	}
-	result, err := i.finish(ctx, &p, root, req.ComposePath)
-	if err == nil {
-		ok = true
-	}
-	return p, result, err
+	return i.FromArchive(ctx, req, zipPath, "upload.zip")
 }
 
 func (i *Importer) FromImage(ctx context.Context, req Request) (store.Project, composecfg.ValidationResult, error) {
