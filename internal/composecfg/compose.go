@@ -120,6 +120,14 @@ func Parse(data []byte, projectID, projectSlug, root string) (Document, Validati
 		return Document{}, result
 	}
 	validateKeys(&rootNode, resultErrorCollector(&result), []string{"name", "version", "services", "volumes", "networks", "x-asgard"}, "compose")
+	missing := map[string]bool{}
+	if err := interpolateNode(&rootNode, interpolationValues(root), missing); err != nil {
+		result.Errors = append(result.Errors, ValidationError{"compose", err.Error()})
+		return Document{}, result
+	}
+	if len(missing) > 0 {
+		result.Warnings = append(result.Warnings, ValidationError{"compose", "Substituted an empty value for undefined variables: " + strings.Join(sortedNames(missing), ", ") + ". Define them in the project's .env file or give them a default."})
+	}
 	var doc Document
 	if err := rootNode.Decode(&doc); err != nil {
 		result.Errors = append(result.Errors, ValidationError{"compose", err.Error()})

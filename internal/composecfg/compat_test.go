@@ -206,3 +206,75 @@ func TestParseEnvFileRejectsMalformedLines(t *testing.T) {
 		t.Fatal("invalid variable name accepted")
 	}
 }
+
+func TestParseInterpolatesFromProjectEnvFile(t *testing.T) {
+	root := writeProject(t, map[string]string{
+		".env": "GOOGLE_CLIENT_SECRET_PATH=/app/secrets/google.json\nTAG=1.27\nEMPTY=\n",
+		"compose.yaml": `services:
+  api:
+    image: nginx:${TAG}
+    environment:
+      SECRET_PATH: ${GOOGLE_CLIENT_SECRET_PATH:-/fallback.json}
+      FROM_EMPTY: ${EMPTY:-defaulted}
+      UNSET_KEPT: ${MISSING-kept}
+      LITERAL: $$NOT_A_VARIABLE
+`,
+	})
+	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	_, result := Parse(data, "project", "demo", root)
+	if !result.Valid {
+		t.Fatalf("interpolation failed validation: %+v", result.Errors)
+	}
+	service := result.Services[serviceNamed(t, result, "api")]
+	if service.Image != "nginx:1.27" {
+		t.Fatalf("image = %q", service.Image)
+	}
+	if got := service.Environment["SECRET_PATH"]; got != "/app/secrets/google.json" {
+		t.Fatalf("SECRET_PATH = %q", got)
+	}
+	if got := service.Environment["FROM_EMPTY"]; got != "defaulted" {
+		t.Fatalf(":- must replace an empty value, got %q", got)
+	}
+	if got := service.Environment["UNSET_KEPT"]; got != "kept" {
+		t.Fatalf("UNSET_KEPT = %q", got)
+	}
+	if got := service.Environment["LITERAL"]; got != "$NOT_A_VARIABLE" {
+		t.Fatalf("$$ must escape to a literal dollar, got %q", got)
+	}
+}
+
+func TestParseWarnsAboutUndefinedVariables(t *testing.T) {
+	root := writeProject(t, map[string]string{"compose.yaml": `services:
+  api:
+    image: nginx:1.27
+    environment:
+      MISSING: ${NOT_DEFINED}
+`})
+	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	_, result := Parse(data, "project", "demo", root)
+	if !result.Valid {
+		t.Fatalf("an undefined variable must warn, not fail: %+v", result.Errors)
+	}
+	found := false
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning.Message, "NOT_DEFINED") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %+v", result.Warnings)
+	}
+}
+
+func TestParseFailsOnRequiredVariable(t *testing.T) {
+	root := writeProject(t, map[string]string{"compose.yaml": `services:
+  api:
+    image: nginx:1.27
+    environment:
+      NEEDED: ${MUST_BE_SET:?set this before deploying}
+`})
+	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	if _, result := Parse(data, "project", "demo", root); result.Valid {
+		t.Fatal("${VAR:?message} must fail validation when the variable is unset")
+	}
+}
