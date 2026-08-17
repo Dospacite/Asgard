@@ -94,6 +94,7 @@ type Project struct {
 	SourceType         string    `json:"sourceType"`
 	SourceURL          string    `json:"sourceUrl"`
 	SourceRef          string    `json:"sourceRef"`
+	SourceCommit       string    `json:"sourceCommit,omitempty"`
 	SourceCredentialID string    `json:"sourceCredentialId,omitempty"`
 	SourcePath         string    `json:"-"`
 	ComposePath        string    `json:"composePath"`
@@ -218,7 +219,7 @@ func parseTimePtr(raw sql.NullString) *time.Time {
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects ORDER BY updated_at DESC`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_commit,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +227,7 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 	for rows.Next() {
 		var p Project
 		var created, updated string
-		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated); err != nil {
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCommit, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -253,8 +254,8 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 func (s *Store) GetProject(ctx context.Context, idOrSlug string) (Project, error) {
 	var p Project
 	var created, updated string
-	err := s.DB.QueryRowContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects WHERE id=? OR slug=?`, idOrSlug, idOrSlug).
-		Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated)
+	err := s.DB.QueryRowContext(ctx, `SELECT id,slug,name,description,source_type,source_url,source_ref,source_commit,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at FROM projects WHERE id=? OR slug=?`, idOrSlug, idOrSlug).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.SourceType, &p.SourceURL, &p.SourceRef, &p.SourceCommit, &p.SourceCredentialID, &p.SourcePath, &p.ComposePath, &p.PrimaryService, &created, &updated)
 	if err != nil {
 		return p, err
 	}
@@ -367,7 +368,7 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 	}
 	defer tx.Rollback()
 	now := Now()
-	_, err = tx.ExecContext(ctx, `INSERT INTO projects(id,slug,name,description,source_type,source_url,source_ref,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.Slug, p.Name, p.Description, p.SourceType, p.SourceURL, p.SourceRef, p.SourceCredentialID, p.SourcePath, p.ComposePath, p.PrimaryService, now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO projects(id,slug,name,description,source_type,source_url,source_ref,source_commit,source_credential_id,source_path,compose_path,primary_service,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.Slug, p.Name, p.Description, p.SourceType, p.SourceURL, p.SourceRef, p.SourceCommit, p.SourceCredentialID, p.SourcePath, p.ComposePath, p.PrimaryService, now, now)
 	if err != nil {
 		return err
 	}

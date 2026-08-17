@@ -104,6 +104,7 @@ func (s *Server) routes() http.Handler {
 			r.Patch("/", s.updateProject)
 			r.Get("/source-files", s.sourceFiles)
 			r.Patch("/source-files", s.updateSourceFile)
+			r.Post("/source-sync", s.resyncSource)
 			r.Get("/deployments", s.deployments)
 			r.Post("/deployments", s.createDeployment)
 			r.Post("/rollbacks", s.rollback)

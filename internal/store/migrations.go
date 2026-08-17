@@ -349,4 +349,7 @@ PRAGMA user_version = 3;
 // SQLite has no IF NOT EXISTS for ADD COLUMN, so each is probed first.
 var addedColumns = []struct{ table, column, definition string }{
 	{"projects", "source_credential_id", "TEXT NOT NULL DEFAULT ''"},
+	// Records the commit a Git import or re-sync captured, so operators can see
+	// which revision the working tree that deployments build actually holds.
+	{"projects", "source_commit", "TEXT NOT NULL DEFAULT ''"},
 }

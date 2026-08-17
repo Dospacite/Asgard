@@ -153,6 +153,66 @@ func Save(ctx context.Context, database *store.Store, project store.Project, dom
 	return Load(updated)
 }
 
+// ReplaceTree reconciles a project's services after its whole source tree has
+// been replaced, applying the same merge an in-place Compose edit uses so
+// runtime overrides an operator set through Asgard survive the swap.
+//
+// swap installs the new tree and must be reversible by its caller: it runs
+// inside the reconcile so an invalid Compose file never reaches the live tree,
+// and a database failure after it leaves both to be rolled back together.
+// incomingRoot is where the new tree is staged; env files and project-relative
+// mounts have to resolve against it rather than the tree being replaced.
+func ReplaceTree(ctx context.Context, database *store.Store, project store.Project, domain, previousCompose, incomingCompose, incomingRoot string, swap func() error) (composecfg.ValidationResult, error) {
+	_, incoming := composecfg.Parse([]byte(incomingCompose), project.ID, project.Slug, incomingRoot)
+	adaptDomain(&incoming, domain)
+	if !incoming.Valid {
+		return incoming, &Problem{Code: "compose_invalid", Message: "The re-synced Compose file is not valid for this platform. The running project was left untouched.", Validation: &incoming}
+	}
+	_, previous := composecfg.Parse([]byte(previousCompose), project.ID, project.Slug, project.SourcePath)
+	adaptDomain(&previous, domain)
+	if err := rejectServiceRemoval(project.Services, incoming.Services, &incoming); err != nil {
+		return incoming, err
+	}
+
+	tx, err := database.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return incoming, err
+	}
+	defer tx.Rollback()
+	previousByName := map[string]store.Service{}
+	if previous.Valid {
+		for _, service := range previous.Services {
+			previousByName[service.Name] = service
+		}
+	}
+	currentByName := map[string]store.Service{}
+	for _, service := range project.Services {
+		currentByName[service.Name] = service
+	}
+	for _, parsed := range incoming.Services {
+		currentService, exists := currentByName[parsed.Name]
+		if !exists {
+			parsed.ID = uuid.NewString()
+			parsed.ProjectID = project.ID
+			if err := insertService(ctx, tx, parsed); err != nil {
+				return incoming, err
+			}
+			continue
+		}
+		merged := mergeService(currentService, previousByName[parsed.Name], parsed, previous.Valid)
+		if err := updateComposedService(ctx, tx, merged, currentService.ConfigRevision); err != nil {
+			return incoming, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE projects SET primary_service=?,updated_at=? WHERE id=?`, incoming.PrimaryService, store.Now(), project.ID); err != nil {
+		return incoming, err
+	}
+	if err := swap(); err != nil {
+		return incoming, err
+	}
+	return incoming, tx.Commit()
+}
+
 func ParseDotEnv(content string) (map[string]string, []composecfg.ValidationError) {
 	values := map[string]string{}
 	issues := []composecfg.ValidationError{}

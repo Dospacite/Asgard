@@ -135,4 +135,17 @@ func (i *Importer) clone(ctx context.Context, source composecfg.GitSource, ref, 
 	return nil
 }
 
+// headCommit reads the commit a clone landed on. It runs before the clone's
+// .git directory is discarded, and is the only record of which revision the
+// working tree that deployments build actually holds.
+func (i *Importer) headCommit(ctx context.Context, root string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "HEAD")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("read cloned revision: %s", sanitizeOutput(output))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'" }

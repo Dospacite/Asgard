@@ -117,6 +117,47 @@ func (s *Server) updateSourceFile(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, workspace)
 }
 
+// resyncSource re-fetches a Git project's repository so the next deployment
+// builds its current head instead of the tree captured at import.
+func (s *Server) resyncSource(w http.ResponseWriter, r *http.Request) {
+	project, err := s.Store.GetProject(r.Context(), chi.URLParam(r, "projectID"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.Importer.Resync(r.Context(), project.ID)
+	if err != nil {
+		if errors.Is(err, importer.ErrNotGitSource) {
+			httpx.Error(w, http.StatusConflict, "source_not_git", "Only projects imported from Git can be re-synced. Edit the Compose file directly, or import the project again.")
+			return
+		}
+		var problem *projectsource.Problem
+		if errors.As(err, &problem) {
+			details := map[string]any{}
+			if problem.Validation != nil {
+				details["validation"] = problem.Validation
+			}
+			httpx.JSON(w, http.StatusUnprocessableEntity, httpx.ErrorBody{Error: httpx.APIError{Code: problem.Code, Message: problem.Message, Details: details}})
+			return
+		}
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{"code": "resync_failed", "message": err.Error()}})
+		return
+	}
+	s.auditRequest(r, "project.source.resync", "project", project.ID, "Re-synced source to "+shortCommit(result.Commit))
+	w.Header().Set("Cache-Control", "no-store")
+	httpx.JSON(w, http.StatusOK, result)
+}
+
+func shortCommit(commit string) string {
+	if len(commit) > 12 {
+		return commit[:12]
+	}
+	if commit == "" {
+		return "an unknown revision"
+	}
+	return commit
+}
+
 func (s *Server) importGit(w http.ResponseWriter, r *http.Request) {
 	var req importer.Request
 	if !httpx.Decode(w, r, &req) {

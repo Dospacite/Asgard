@@ -68,11 +68,16 @@ func (i *Importer) FromGit(ctx context.Context, req Request) (store.Project, com
 	if err := i.clone(cloneCtx, source, req.Ref, root, auth); err != nil {
 		return p, composecfg.ValidationResult{}, err
 	}
+	commit, err := i.headCommit(cloneCtx, root)
+	if err != nil {
+		return p, composecfg.ValidationResult{}, err
+	}
 	// The clone's git metadata can hold credential-bearing remotes and is never
 	// needed again; the deployer builds from the extracted working tree.
 	_ = os.RemoveAll(filepath.Join(root, ".git"))
 	p.SourceURL = source.URL
 	p.SourceRef = req.Ref
+	p.SourceCommit = commit
 	if auth != nil {
 		p.SourceCredentialID = auth.credential.ID
 	}

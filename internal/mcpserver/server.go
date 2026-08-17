@@ -284,6 +284,7 @@ func (s *Server) addTools() {
 	mcp.AddTool(s.MCP, writeTool("git_credential_delete", "Delete a Git credential", "Remove a stored Git credential. Projects already imported with it keep their source.", true, true, false), s.deleteGitCredential)
 	mcp.AddTool(s.MCP, writeTool("project_import_image", "Import public OCI image", "Create a project from a public OCI image or Docker Hub URL.", false, false, true), s.importImage)
 	mcp.AddTool(s.MCP, writeTool("project_source_update", "Update project source file", "Revision-check, validate, and replace one editable Compose, Dockerfile, or .env file. Compose saves reconcile source-owned service fields while preserving runtime overrides.", true, false, false), s.updateProjectSource)
+	mcp.AddTool(s.MCP, writeTool("project_source_resync", "Re-sync project source from Git", "Re-clone a Git-imported project's repository and replace its working tree, so the next deployment builds the branch's current head instead of the commit captured at import. Returns the synced commit. Deployments do not fetch on their own: call this first whenever new commits should go live. The project's .env is preserved and runtime overrides survive; an invalid incoming Compose file leaves the running project untouched.", true, false, true), s.resyncProjectSource)
 	mcp.AddTool(s.MCP, writeTool("deployment_create", "Deploy project", "Queue an idempotent, health-gated versioned deployment and return its operation.", true, false, true), s.deploy)
 	mcp.AddTool(s.MCP, writeTool("deployment_rollback", "Roll back project", "Queue recreation of an earlier successful release and atomically switch traffic.", true, false, false), s.rollback)
 	mcp.AddTool(s.MCP, writeTool("service_config_update", "Update service configuration", "Update limits, public route, environment, role, and restart behavior with revision protection.", true, false, false), s.updateConfig)
@@ -322,6 +323,22 @@ func (s *Server) updateProjectSource(ctx context.Context, _ *mcp.CallToolRequest
 	}
 	audit(ctx, s.Store, "project.source.update", "project", project.ID, "Agent updated source file "+filepath.ToSlash(filepath.Clean(in.Path)))
 	return nil, workspace, nil
+}
+
+func (s *Server) resyncProjectSource(ctx context.Context, _ *mcp.CallToolRequest, in ProjectInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:deploy"); err != nil {
+		return nil, nil, err
+	}
+	project, err := s.Store.GetProject(ctx, in.ProjectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := s.Importer.Resync(ctx, project.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	audit(ctx, s.Store, "project.source.resync", "project", project.ID, "Agent re-synced source to "+result.Commit)
+	return nil, result, nil
 }
 
 func (s *Server) networksList(ctx context.Context, _ *mcp.CallToolRequest, _ Empty) (*mcp.CallToolResult, any, error) {
