@@ -17,10 +17,11 @@ Use the Asgard MCP tools as the source of truth. Inspect before mutating.
 6. Inspect `network_topology_get` before changing connectivity. Projects are isolated by default; create or reuse a shared network only for an explicit private dependency.
 7. Use `network_service_attach` with a stable, descriptive alias. The default `<project>--<service>` alias is preferred because it avoids collisions. Applications connect to `http://<alias>:<container-port>`, never the public hostname, for private traffic.
 8. Verify both endpoints with `networks_list`. Use `network_reconcile` after a container replacement or unexpected disconnect; persisted memberships are also restored automatically during deployment and control-plane startup.
-9. Create deployments with a fresh stable idempotency key. Poll `operation_get` and `operation_logs_get` until a terminal state.
-10. If a release fails health gates, inspect its logs. Roll back only to a successful release and monitor the rollback operation to completion.
-11. Archives (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`) are uploaded through the control-plane UI or `POST /api/v1/imports/archive`; there is no MCP upload tool, so direct the user there when the source is a local archive.
-12. Use the least OAuth scope that covers the work. Network and source changes require `asgard:configure`; never request delete access for ordinary deployment work.
+9. For a Git project, call `project_source_resync` before deploying whenever new commits should go live. Deployments build the project's stored working tree and never fetch on their own, so without a re-sync the build reuses its cached layers and republishes the commit already captured — a green release that ships nothing new. Confirm the returned `commit` is the one you expect, then deploy.
+10. Create deployments with a fresh stable idempotency key. Poll `operation_get` and `operation_logs_get` until a terminal state.
+11. If a release fails health gates, inspect its logs. Roll back only to a successful release and monitor the rollback operation to completion.
+12. Archives (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`) are uploaded through the control-plane UI or `POST /api/v1/imports/archive`; there is no MCP upload tool, so direct the user there when the source is a local archive.
+13. Use the least OAuth scope that covers the work. Network and source changes require `asgard:configure`; never request delete access for ordinary deployment work.
 
 ## Network boundaries
 
