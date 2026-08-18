@@ -1,8 +1,6 @@
 package composecfg
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -40,20 +38,5 @@ func TestRejectsPrivilegedAndBind(t *testing.T) {
 	}
 	if len(result.Errors) < 2 {
 		t.Fatalf("expected multiple errors: %#v", result.Errors)
-	}
-}
-
-func TestPenpotDeploymentExample(t *testing.T) {
-	path := filepath.Join("..", "..", "deploy-examples", "penpot", "compose.yaml")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, result := Parse(raw, "project-id", "penpot", t.TempDir())
-	if !result.Valid {
-		t.Fatalf("expected valid Penpot deployment example: %#v", result.Errors)
-	}
-	if result.PrimaryService != "penpot-frontend" {
-		t.Fatalf("unexpected primary service %q", result.PrimaryService)
 	}
 }

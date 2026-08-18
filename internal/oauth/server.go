@@ -333,7 +333,7 @@ func (s *Server) validateAuthorize(ctx context.Context, params url.Values) (url.
 	if err != nil {
 		return params, Client{}, oauthValidationError{"invalid_request", "Unknown or invalid client."}
 	}
-	if !contains(client.RedirectURIs, redirect) {
+	if !redirectRegistered(client.RedirectURIs, redirect) {
 		return params, client, oauthValidationError{"invalid_request", "redirect_uri is not registered for this client."}
 	}
 	if params.Get("code_challenge_method") != "S256" || len(params.Get("code_challenge")) < 43 {
@@ -433,6 +433,41 @@ func (s *Server) redirectWithError(w http.ResponseWriter, r *http.Request, param
 	}
 	destination.RawQuery = query.Encode()
 	http.Redirect(w, r, destination.String(), http.StatusFound)
+}
+
+// redirectRegistered matches a requested redirect URI against the client's
+// registered set. Native clients such as Claude Code listen on an ephemeral
+// loopback port they only learn at request time, so RFC 8252 section 7.3
+// requires the port to be ignored for loopback redirects. Every other part of
+// the URI still has to match exactly.
+func redirectRegistered(registered []string, requested string) bool {
+	if contains(registered, requested) {
+		return true
+	}
+	target, err := url.Parse(requested)
+	if err != nil || !isLoopbackRedirect(target) {
+		return false
+	}
+	for _, item := range registered {
+		candidate, err := url.Parse(item)
+		if err != nil || !isLoopbackRedirect(candidate) {
+			continue
+		}
+		if strings.EqualFold(candidate.Hostname(), target.Hostname()) &&
+			candidate.EscapedPath() == target.EscapedPath() &&
+			candidate.RawQuery == target.RawQuery {
+			return true
+		}
+	}
+	return false
+}
+
+func isLoopbackRedirect(parsed *url.URL) bool {
+	if parsed == nil || !strings.EqualFold(parsed.Scheme, "http") {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 func validateRedirectURI(raw string) error {

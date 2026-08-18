@@ -1,6 +1,8 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "asgard",
-  "version": "0.3.0",
+  "displayName": "Asgard",
+  "version": "0.4.0",
   "description": "Deploy and operate small applications on an Asgard control plane through its OAuth-protected MCP server.",
   "author": {
     "name": "Rousoftware"

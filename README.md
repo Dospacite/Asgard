@@ -59,7 +59,11 @@ On the deployed VPS, the generated one-time password is root-readable at `/root/
 
 The MCP endpoint is `https://asgard.rousoftware.com/mcp`. Clients discover OAuth metadata at `/.well-known/oauth-protected-resource/mcp`, register dynamically, and ask the administrator to approve explicit Asgard scopes in the browser. Project source can be inspected and revision-safely updated with `project_source_get` and `project_source_update`, and a Git project's working tree is refreshed to its branch head with `project_source_resync` before `deployment_create`; runtime environment selection remains available through `service_config_update`. Private repositories are reached with `git_credentials_list`, `git_credential_create`, and the `credentialId` field of `project_import_git`.
 
-The plugin lives under `plugins/asgard` and carries both manifests: `.claude-plugin/plugin.json` for Claude Code and `.codex-plugin/plugin.json` for Codex. Marketplace entries are in `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json` respectively. Install it into Claude Code with:
+The plugin lives under `plugins/asgard` and carries both manifests: `.claude-plugin/plugin.json` for Claude Code and `.codex-plugin/plugin.json` for Codex. Marketplace entries are in `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json` respectively.
+
+Both hosts share the `asgard-deploy` and `asgard-develop` skills. The Claude Code side adds components Codex does not consume: `commands/` provides the `/asgard-status`, `/asgard-deploy`, and `/asgard-rollback` slash commands, and `agents/asgard-release-monitor.md` provides a read-only subagent that polls an in-flight operation to a terminal state and reports the outcome with log evidence. Codex-specific per-skill interface metadata stays in `skills/*/agents/openai.yaml`.
+
+Install it into Claude Code with:
 
 ```sh
 claude plugin marketplace add /path/to/Asgard

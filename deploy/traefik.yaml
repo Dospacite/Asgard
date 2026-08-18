@@ -18,10 +18,14 @@ entryPoints:
       respondingTimeouts:
         # Traefik v3 defaults readTimeout to 60s, which caps how long a client
         # may take to send a request body. CI runners pushing multi-megabyte
-        # build artifacts over slow egress exceed that and get cut off mid-body,
-        # surfacing as a 502/499 that looks like a server fault. Raised to give
-        # large uploads room while still bounding slowloris-style stalls.
-        readTimeout: 600s
+        # build artifacts get cut off mid-body, surfacing as a 502/499 that
+        # looks like a server fault.
+        #
+        # 1800s is deliberately generous: measured throughput from GitHub
+        # runners to this host is 5-57 KB/s (against 22 MB/s to Cloudflare), so
+        # the GitHub route is the constraint and a 7 MB artifact can legitimately
+        # need 20 minutes. idleTimeout still bounds genuinely stalled clients.
+        readTimeout: 1800s
         idleTimeout: 180s
 providers:
   file:
