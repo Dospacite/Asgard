@@ -14,6 +14,15 @@ entryPoints:
           permanent: true
   websecure:
     address: :443
+    transport:
+      respondingTimeouts:
+        # Traefik v3 defaults readTimeout to 60s, which caps how long a client
+        # may take to send a request body. CI runners pushing multi-megabyte
+        # build artifacts over slow egress exceed that and get cut off mid-body,
+        # surfacing as a 502/499 that looks like a server fault. Raised to give
+        # large uploads room while still bounding slowloris-style stalls.
+        readTimeout: 600s
+        idleTimeout: 180s
 providers:
   file:
     directory: /data/traefik/dynamic
