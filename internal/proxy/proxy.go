@@ -16,6 +16,10 @@ import (
 type Generator struct {
 	Store *store.Store
 	Dir   string
+	// Domain is the control plane's own wildcard zone. Hostnames inside it get
+	// the strong HSTS defaults; anything else has to opt in. Leaving it empty
+	// means no name is treated as in-zone, which is the safe direction to fail.
+	Domain string
 }
 
 type config struct {
@@ -55,6 +59,51 @@ type healthCheck struct {
 type middleware struct {
 	Headers headers `yaml:"headers"`
 }
+
+// hstsYear is the max-age every policy that sends the header at all uses.
+const hstsYear = 31536000
+
+// baseHeaders are the header protections that are safe on any hostname:
+// they constrain how this response is treated, and make no claim about other
+// names.
+func baseHeaders() headers {
+	return headers{FrameDeny: true, ContentTypeNosniff: true, ReferrerPolicy: "strict-origin-when-cross-origin"}
+}
+
+// securityMiddlewares builds one middleware per HSTS policy. Traefik dedupes
+// by name, so emitting all four costs nothing and keeps the generated file
+// readable next to the routers that reference them.
+func securityMiddlewares() map[string]middleware {
+	strict := baseHeaders()
+	strict.STSSeconds, strict.STSIncludeSubdomains, strict.STSPreload = hstsYear, true, true
+	standard := baseHeaders()
+	standard.STSSeconds = hstsYear
+	return map[string]middleware{
+		middlewareName(store.HSTSStrict):   {Headers: strict},
+		middlewareName(store.HSTSStandard): {Headers: standard},
+		middlewareName(store.HSTSOff):      {Headers: baseHeaders()},
+	}
+}
+
+// middlewareName maps a policy to its Traefik middleware.
+//
+// None of these may be called "asgard-security". Traefik's file provider shares
+// one middleware namespace across every file in the directory, and the control
+// plane's own control-plane.yml already defines "asgard-security" with the
+// strong header for its own hostname. A generated file redefining that name
+// with different contents makes which definition wins non-deterministic, and
+// hand-written custom-domain files in the same directory reference it by name.
+func middlewareName(policy string) string {
+	switch policy {
+	case store.HSTSStrict:
+		return "asgard-hsts-strict"
+	case store.HSTSOff:
+		return "asgard-hsts-off"
+	default:
+		return "asgard-hsts"
+	}
+}
+
 type headers struct {
 	FrameDeny            bool   `yaml:"frameDeny"`
 	ContentTypeNosniff   bool   `yaml:"contentTypeNosniff"`
@@ -67,21 +116,22 @@ type headers struct {
 var safeName = regexp.MustCompile(`[^a-zA-Z0-9-]+`)
 
 func (g *Generator) Write(ctx context.Context) error {
-	rows, err := g.Store.DB.QueryContext(ctx, `SELECT r.id,r.hostname,r.target_port,s.health_path,rc.docker_name FROM routes r JOIN services s ON s.id=r.service_id JOIN runtime_containers rc ON rc.service_id=r.service_id AND rc.active=1 WHERE r.tls=1 ORDER BY r.hostname`)
+	rows, err := g.Store.DB.QueryContext(ctx, `SELECT r.id,r.hostname,r.target_port,s.health_path,s.hsts_mode,rc.docker_name FROM routes r JOIN services s ON s.id=r.service_id JOIN runtime_containers rc ON rc.service_id=r.service_id AND rc.active=1 WHERE r.tls=1 ORDER BY r.hostname`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	cfg := config{HTTP: httpConfig{Routers: map[string]router{}, Services: map[string]service{}, Middlewares: map[string]middleware{"asgard-security": {Headers: headers{FrameDeny: true, ContentTypeNosniff: true, ReferrerPolicy: "strict-origin-when-cross-origin", STSSeconds: 31536000, STSIncludeSubdomains: true, STSPreload: true}}}}}
+	cfg := config{HTTP: httpConfig{Routers: map[string]router{}, Services: map[string]service{}, Middlewares: securityMiddlewares()}}
 	for rows.Next() {
-		var id, hostname, healthPath, containerName string
+		var id, hostname, healthPath, hstsMode, containerName string
 		var port int
-		if err := rows.Scan(&id, &hostname, &port, &healthPath, &containerName); err != nil {
+		if err := rows.Scan(&id, &hostname, &port, &healthPath, &hstsMode, &containerName); err != nil {
 			return err
 		}
 		name := strings.Trim(safeName.ReplaceAllString(id, "-"), "-")
 		serviceName := "svc-" + name
-		cfg.HTTP.Routers["route-"+name] = router{Rule: fmt.Sprintf("Host(`%s`)", hostname), EntryPoints: []string{"websecure"}, Service: serviceName, Middlewares: []string{"asgard-security"}, TLS: tls{CertResolver: "letsencrypt"}}
+		security := middlewareName(resolveHSTS(hstsMode, hostname, g.Domain))
+		cfg.HTTP.Routers["route-"+name] = router{Rule: fmt.Sprintf("Host(`%s`)", hostname), EntryPoints: []string{"websecure"}, Service: serviceName, Middlewares: []string{security}, TLS: tls{CertResolver: "letsencrypt"}}
 		check := &healthCheck{Path: healthPath, Interval: "15s", Timeout: "3s"}
 		cfg.HTTP.Services[serviceName] = service{LoadBalancer: loadBalancer{Servers: []server{{URL: fmt.Sprintf("http://%s:%d", containerName, port)}}, PassHostHeader: true, HealthCheck: check}}
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/rousoftware/asgard/internal/oauth"
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/reclaim"
 	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
@@ -32,7 +33,10 @@ type App struct {
 	Networks   *networking.Manager
 	Operations *operations.Manager
 	API        *api.Server
+	proxy      *proxy.Generator
 	collector  *dockerx.Collector
+	sweeper    *reclaim.Sweeper
+	verifier   *importer.Verifier
 	http       *http.Server
 }
 
@@ -54,7 +58,7 @@ func New(cfg config.Config) (*App, error) {
 	if err != nil {
 		return fail(fmt.Errorf("create Docker client: %w", err))
 	}
-	proxyGenerator := &proxy.Generator{Store: database, Dir: cfg.TraefikDynamicDir}
+	proxyGenerator := &proxy.Generator{Store: database, Dir: cfg.TraefikDynamicDir, Domain: cfg.Domain}
 	ops := operations.New(database, cfg.OperationWorkers)
 	deployer := &deploy.Deployer{Store: database, Docker: engine, Proxy: proxyGenerator, EdgeNetwork: cfg.EdgeNetwork, DataDir: cfg.DataDir, DataVolume: cfg.DataVolume}
 	ops.Register("deployment.create", deployer.Handle)
@@ -68,21 +72,41 @@ func New(cfg config.Config) (*App, error) {
 	}
 	projectImporter := &importer.Importer{Store: database, ProjectsDir: cfg.ProjectsDir, DataDir: cfg.DataDir, Domain: cfg.Domain, Secrets: secretBox}
 	networkManager := &networking.Manager{Store: database, Docker: engine, EdgeNetwork: cfg.EdgeNetwork}
+	reclaimer := &reclaim.Reclaimer{Store: database, Docker: engine, Policy: reclaim.Policy{KeepReleases: cfg.KeepReleaseImages, BuildCacheBytes: cfg.BuildCacheBytes}}
+	sweeper := &reclaim.Sweeper{Reclaimer: reclaimer, Interval: cfg.ReclaimInterval}
+	deployer.Reclaimer = reclaimer
+
 	oauthServer := oauth.New(database, authService, cfg.PublicURL)
-	mcpServer := mcpserver.New(mcpserver.Dependencies{Config: cfg, Store: database, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, Secrets: secretBox})
-	server := api.New(api.Dependencies{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, OAuth: oauthServer, MCP: mcpServer.Handler, Secrets: secretBox})
+	mcpServer := mcpserver.New(mcpserver.Dependencies{Config: cfg, Store: database, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, Secrets: secretBox, Reclaimer: reclaimer})
+	server := api.New(api.Dependencies{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, OAuth: oauthServer, MCP: mcpServer.Handler, Secrets: secretBox, Reclaimer: reclaimer})
 	collector := &dockerx.Collector{Engine: engine, Store: database, Interval: cfg.MetricsInterval}
-	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, collector: collector}, nil
+	verifier := &importer.Verifier{Importer: projectImporter, Interval: cfg.CredentialVerifyInterval}
+	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, proxy: proxyGenerator, collector: collector, verifier: verifier, sweeper: sweeper}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
 	if err := a.Networks.ReconcileAll(ctx); err != nil {
 		slog.Warn("shared network reconciliation completed with errors", "error", err)
 	}
+	// Regenerate the router configuration from the current state of the store.
+	// The file is otherwise only rewritten by a deployment or a route change,
+	// so a control plane whose routing policy changed between versions — an
+	// HSTS default, a middleware name, a header — would keep serving the
+	// previous version's file until every project happened to be redeployed.
+	if err := a.proxy.Write(ctx); err != nil {
+		slog.Warn("router configuration could not be regenerated", "error", err)
+	}
 	if err := a.Operations.Start(ctx); err != nil {
 		return err
 	}
 	a.collector.Start(ctx)
+	// ASGARD_CREDENTIAL_VERIFY_HOURS=0 turns the sweep off for an operator who
+	// does not want the control plane reaching out to Git hosts on its own.
+	if a.Config.CredentialVerifyInterval > 0 {
+		a.verifier.Start(ctx)
+	}
+	// ASGARD_RECLAIM_HOURS=0 leaves disk management entirely to the operator.
+	a.sweeper.Start(ctx)
 	a.http = &http.Server{Addr: a.Config.ListenAddr, Handler: a.API.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
 	errCh := make(chan error, 1)
 	go func() {
@@ -95,6 +119,8 @@ func (a *App) Run(ctx context.Context) error {
 		defer cancel()
 		_ = a.http.Shutdown(shutdownCtx)
 		a.collector.Stop()
+		a.verifier.Stop()
+		a.sweeper.Stop()
 		a.Operations.Wait()
 		return nil
 	case err := <-errCh:
@@ -105,4 +131,10 @@ func (a *App) Run(ctx context.Context) error {
 	}
 }
 
-func (a *App) Close() error { a.collector.Stop(); _ = a.Docker.Close(); return a.Store.Close() }
+func (a *App) Close() error {
+	a.collector.Stop()
+	a.verifier.Stop()
+	a.sweeper.Stop()
+	_ = a.Docker.Close()
+	return a.Store.Close()
+}

@@ -24,7 +24,7 @@ Identify processes, listening ports, build commands, runtime commands, stateful 
 
 ## Compose metadata
 
-Use top-level `x-asgard.primary-service`. Under `x-asgard.services.<name>`, declare `role` (`web`, `worker`, or `stateful`), `public`, internal `port`, and `health-path`. Public primary services receive `<project>.asgard.rousoftware.com`; additional public services receive `<service>--<project>.asgard.rousoftware.com`.
+Use top-level `x-asgard.primary-service`. Under `x-asgard.services.<name>`, declare `role` (`web`, `worker`, or `stateful`), `public`, internal `port`, and `health-path`. Public primary services receive `<project>.<ASGARD_DOMAIN>`; additional public services receive `<service>--<project>.<ASGARD_DOMAIN>`, where `ASGARD_DOMAIN` is the wildcard zone the control plane is configured with. A service may also set an explicit `hostname` for any fully qualified name whose DNS points at the host.
 
 Compose `depends_on` and service-name DNS cover dependencies inside one project. Cross-project networks are an Asgard deployment concern: document the source service, destination service, container port, preferred alias, and whether the shared bridge needs its own external gateway. Do not add unsupported Compose network directives unless `compose_contract_get` explicitly permits them.
 

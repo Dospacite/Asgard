@@ -51,6 +51,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return fmt.Errorf("add %s.%s: %w", item.table, item.column, err)
 		}
 	}
+	for _, statement := range addedIndexes {
+		if _, err := s.DB.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("create index: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -106,31 +111,34 @@ type Project struct {
 }
 
 type Service struct {
-	ID             string            `json:"id"`
-	ProjectID      string            `json:"projectId"`
-	Name           string            `json:"name"`
-	Role           string            `json:"role"`
-	Image          string            `json:"image"`
-	BuildContext   string            `json:"buildContext"`
-	Dockerfile     string            `json:"dockerfile"`
-	Command        []string          `json:"command"`
-	Environment    map[string]string `json:"environment"`
-	Public         bool              `json:"public"`
-	Port           int               `json:"port"`
-	Hostname       string            `json:"hostname"`
-	HealthPath     string            `json:"healthPath"`
-	CPULimit       float64           `json:"cpuLimit"`
-	MemoryLimit    int64             `json:"memoryLimit"`
-	PIDsLimit      int64             `json:"pidsLimit"`
-	RestartPolicy  string            `json:"restartPolicy"`
-	DependsOn      []string          `json:"dependsOn"`
-	Volumes        []string          `json:"volumes"`
-	Networks       []NetworkRef      `json:"networks,omitempty"`
-	ConfigRevision int               `json:"configRevision"`
-	CreatedAt      time.Time         `json:"createdAt"`
-	UpdatedAt      time.Time         `json:"updatedAt"`
-	Runtime        *Runtime          `json:"runtime,omitempty"`
-	Metrics        *Metrics          `json:"metrics,omitempty"`
+	ID           string            `json:"id"`
+	ProjectID    string            `json:"projectId"`
+	Name         string            `json:"name"`
+	Role         string            `json:"role"`
+	Image        string            `json:"image"`
+	BuildContext string            `json:"buildContext"`
+	Dockerfile   string            `json:"dockerfile"`
+	Command      []string          `json:"command"`
+	Environment  map[string]string `json:"environment"`
+	Public       bool              `json:"public"`
+	Port         int               `json:"port"`
+	Hostname     string            `json:"hostname"`
+	HealthPath   string            `json:"healthPath"`
+	// HSTSMode chooses the Strict-Transport-Security policy for this service's
+	// public route. Empty derives it from the hostname's zone; see hsts.go.
+	HSTSMode       string       `json:"hstsMode"`
+	CPULimit       float64      `json:"cpuLimit"`
+	MemoryLimit    int64        `json:"memoryLimit"`
+	PIDsLimit      int64        `json:"pidsLimit"`
+	RestartPolicy  string       `json:"restartPolicy"`
+	DependsOn      []string     `json:"dependsOn"`
+	Volumes        []string     `json:"volumes"`
+	Networks       []NetworkRef `json:"networks,omitempty"`
+	ConfigRevision int          `json:"configRevision"`
+	CreatedAt      time.Time    `json:"createdAt"`
+	UpdatedAt      time.Time    `json:"updatedAt"`
+	Runtime        *Runtime     `json:"runtime,omitempty"`
+	Metrics        *Metrics     `json:"metrics,omitempty"`
 }
 
 type NetworkRef struct {
@@ -182,15 +190,43 @@ type Runtime struct {
 }
 
 type Metrics struct {
-	CPUPercent  float64   `json:"cpuPercent"`
-	MemoryBytes int64     `json:"memoryBytes"`
-	MemoryLimit int64     `json:"memoryLimit"`
-	NetworkRX   int64     `json:"networkRx"`
-	NetworkTX   int64     `json:"networkTx"`
-	BlockRead   int64     `json:"blockRead"`
-	BlockWrite  int64     `json:"blockWrite"`
-	PIDs        int64     `json:"pids"`
+	CPUPercent  float64 `json:"cpuPercent"`
+	MemoryBytes int64   `json:"memoryBytes"`
+	MemoryLimit int64   `json:"memoryLimit"`
+	NetworkRX   int64   `json:"networkRx"`
+	NetworkTX   int64   `json:"networkTx"`
+	BlockRead   int64   `json:"blockRead"`
+	BlockWrite  int64   `json:"blockWrite"`
+	PIDs        int64   `json:"pids"`
+
+	// CPUThrottledPercent is the share of CFS scheduling periods in which the
+	// container was stopped at its CPU quota over this sample's interval. It is
+	// the number that explains a slow request-serving service whose average CPU
+	// looks idle, because bursts that saturate the quota for a few hundred
+	// milliseconds disappear into a 30-second mean. The cumulative counters
+	// below are the raw material it is derived from.
+	CPUThrottledPercent float64 `json:"cpuThrottledPercent"`
+	CPUPeriods          int64   `json:"cpuPeriods"`
+	CPUThrottledPeriods int64   `json:"cpuThrottledPeriods"`
+	CPUThrottledNanos   int64   `json:"cpuThrottledNanos"`
+
 	CollectedAt time.Time `json:"collectedAt"`
+}
+
+// MetricColumns is the projection every metrics read shares, so a new column
+// cannot be added to one query and forgotten in another. ScanMetrics consumes
+// exactly this order.
+const MetricColumns = `cpu_percent,memory_bytes,memory_limit,network_rx,network_tx,block_read,block_write,pids,cpu_throttled_percent,cpu_periods,cpu_throttled_periods,cpu_throttled_nanos,collected_at`
+
+// ScanMetrics reads one row of MetricColumns.
+func ScanMetrics(row interface{ Scan(dest ...any) error }) (Metrics, error) {
+	var m Metrics
+	var collected string
+	if err := row.Scan(&m.CPUPercent, &m.MemoryBytes, &m.MemoryLimit, &m.NetworkRX, &m.NetworkTX, &m.BlockRead, &m.BlockWrite, &m.PIDs, &m.CPUThrottledPercent, &m.CPUPeriods, &m.CPUThrottledPeriods, &m.CPUThrottledNanos, &collected); err != nil {
+		return Metrics{}, err
+	}
+	m.CollectedAt = parseTime(collected)
+	return m, nil
 }
 
 type Operation struct {
@@ -285,7 +321,7 @@ func projectStatus(services []Service) string {
 }
 
 func (s *Store) ListServices(ctx context.Context, projectID string) ([]Service, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,config_revision,created_at,updated_at FROM services WHERE project_id=? ORDER BY name`, projectID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,config_revision,created_at,updated_at FROM services WHERE project_id=? ORDER BY name`, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +330,7 @@ func (s *Store) ListServices(ctx context.Context, projectID string) ([]Service, 
 		var svc Service
 		var cmdJSON, envJSON, depsJSON, volumesJSON, created, updated string
 		var public int
-		if err := rows.Scan(&svc.ID, &svc.ProjectID, &svc.Name, &svc.Role, &svc.Image, &svc.BuildContext, &svc.Dockerfile, &cmdJSON, &envJSON, &public, &svc.Port, &svc.Hostname, &svc.HealthPath, &svc.CPULimit, &svc.MemoryLimit, &svc.PIDsLimit, &svc.RestartPolicy, &depsJSON, &volumesJSON, &svc.ConfigRevision, &created, &updated); err != nil {
+		if err := rows.Scan(&svc.ID, &svc.ProjectID, &svc.Name, &svc.Role, &svc.Image, &svc.BuildContext, &svc.Dockerfile, &cmdJSON, &envJSON, &public, &svc.Port, &svc.Hostname, &svc.HealthPath, &svc.HSTSMode, &svc.CPULimit, &svc.MemoryLimit, &svc.PIDsLimit, &svc.RestartPolicy, &depsJSON, &volumesJSON, &svc.ConfigRevision, &created, &updated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -327,11 +363,8 @@ func (s *Store) ListServices(ctx context.Context, projectID string) ([]Service, 
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		var m Metrics
-		var collected string
-		err = s.DB.QueryRowContext(ctx, `SELECT cpu_percent,memory_bytes,memory_limit,network_rx,network_tx,block_read,block_write,pids,collected_at FROM metrics WHERE service_id=? ORDER BY collected_at DESC LIMIT 1`, svc.ID).Scan(&m.CPUPercent, &m.MemoryBytes, &m.MemoryLimit, &m.NetworkRX, &m.NetworkTX, &m.BlockRead, &m.BlockWrite, &m.PIDs, &collected)
+		m, err := ScanMetrics(s.DB.QueryRowContext(ctx, `SELECT `+MetricColumns+` FROM metrics WHERE service_id=? ORDER BY collected_at DESC LIMIT 1`, svc.ID))
 		if err == nil {
-			m.CollectedAt = parseTime(collected)
 			svc.Metrics = &m
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -377,7 +410,7 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 		env, _ := json.Marshal(svc.Environment)
 		deps, _ := json.Marshal(svc.DependsOn)
 		vols, _ := json.Marshal(svc.Volumes)
-		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
 		if err != nil {
 			return err
 		}
@@ -394,7 +427,7 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 
 func (s *Store) UpdateService(ctx context.Context, svc Service, expectedRevision int) error {
 	env, _ := json.Marshal(svc.Environment)
-	result, err := s.DB.ExecContext(ctx, `UPDATE services SET role=?,env_json=?,public=?,port=?,hostname=?,health_path=?,cpu_limit=?,memory_limit=?,pids_limit=?,restart_policy=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, svc.Role, string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, Now(), svc.ID, expectedRevision)
+	result, err := s.DB.ExecContext(ctx, `UPDATE services SET role=?,env_json=?,public=?,port=?,hostname=?,health_path=?,hsts_mode=?,cpu_limit=?,memory_limit=?,pids_limit=?,restart_policy=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, svc.Role, string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, Now(), svc.ID, expectedRevision)
 	if err != nil {
 		return err
 	}
@@ -411,7 +444,7 @@ func (s *Store) AddService(ctx context.Context, svc Service) error {
 	env, _ := json.Marshal(svc.Environment)
 	deps, _ := json.Marshal(svc.DependsOn)
 	vols, _ := json.Marshal(svc.Volumes)
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, svc.ProjectID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, svc.ProjectID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
 	if err != nil {
 		return err
 	}
@@ -596,4 +629,75 @@ func (s *Store) Health(ctx context.Context) error {
 func IsNotFound(err error) bool { return errors.Is(err, sql.ErrNoRows) }
 func ConflictError(entity, value string) error {
 	return fmt.Errorf("%s %q already exists", entity, value)
+}
+
+// RecentMetrics returns the sampled metrics for a service since a point in
+// time, oldest first.
+func (s *Store) RecentMetrics(ctx context.Context, serviceID string, since time.Time, limit int) ([]Metrics, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+MetricColumns+` FROM metrics WHERE service_id=? AND collected_at>=? ORDER BY collected_at LIMIT ?`, serviceID, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	history := []Metrics{}
+	for rows.Next() {
+		m, err := ScanMetrics(rows)
+		if err != nil {
+			return nil, err
+		}
+		history = append(history, m)
+	}
+	return history, rows.Err()
+}
+
+// ThrottlingSummary condenses the sampled throttling history into the sentence
+// a service page should be able to show without the reader doing arithmetic.
+//
+// It answers the question the CPU average cannot: a service can sit at 0.01%
+// average CPU and still be stopped at its quota in two out of five scheduling
+// periods, because the work arrives in sub-second bursts. Peak matters as much
+// as the mean here — one sustained interval at 60% throttled is a real user
+// waiting, and averaging it across two quiet hours hides it.
+func ThrottlingSummary(history []Metrics, cpuLimit float64) map[string]any {
+	if len(history) == 0 {
+		return map[string]any{"samples": 0, "cpuLimit": cpuLimit}
+	}
+	var total, peak float64
+	var throttledSamples int
+	var periods, throttledPeriods, nanos int64
+	for _, m := range history {
+		total += m.CPUThrottledPercent
+		if m.CPUThrottledPercent > peak {
+			peak = m.CPUThrottledPercent
+		}
+		if m.CPUThrottledPercent >= 1 {
+			throttledSamples++
+		}
+	}
+	// The counters are cumulative, so the span covered by the window is the
+	// difference between its ends rather than the sum of its samples.
+	first, last := history[0], history[len(history)-1]
+	if last.CPUPeriods >= first.CPUPeriods {
+		periods = last.CPUPeriods - first.CPUPeriods
+		throttledPeriods = last.CPUThrottledPeriods - first.CPUThrottledPeriods
+		nanos = last.CPUThrottledNanos - first.CPUThrottledNanos
+	} else {
+		// The container restarted inside the window; its current counters are
+		// everything it has accumulated since.
+		periods, throttledPeriods, nanos = last.CPUPeriods, last.CPUThrottledPeriods, last.CPUThrottledNanos
+	}
+	return map[string]any{
+		"samples":          len(history),
+		"cpuLimit":         cpuLimit,
+		"averagePercent":   total / float64(len(history)),
+		"peakPercent":      peak,
+		"throttledSamples": throttledSamples,
+		"windowPeriods":    periods,
+		"windowThrottled":  throttledPeriods,
+		"windowNanos":      nanos,
+		// Constrained is the flag a dashboard should act on: the workload is
+		// hitting its ceiling often enough that the limit, not the code, is
+		// what an operator should look at first.
+		"constrained": peak >= 10 || total/float64(len(history)) >= 5,
+	}
 }

@@ -56,7 +56,7 @@ x-asgard:
 		t.Fatal(err)
 	}
 	swapped := false
-	validation, err := ReplaceTree(context.Background(), database, project, "asgard.rousoftware.com", string(current), incoming, incomingRoot, func() error {
+	validation, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", string(current), incoming, incomingRoot, func() error {
 		swapped = true
 		return os.WriteFile(filepath.Join(project.SourcePath, project.ComposePath), []byte(incoming), 0o640)
 	})
@@ -106,7 +106,7 @@ func TestReplaceTreeLeavesLiveTreeAloneWhenIncomingIsUnusable(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			swapped := false
-			if _, err := ReplaceTree(context.Background(), database, project, "asgard.rousoftware.com", original, incoming, incomingRoot, func() error {
+			if _, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", original, incoming, incomingRoot, func() error {
 				swapped = true
 				return nil
 			}); err == nil {

@@ -17,6 +17,7 @@ import (
 	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/rousoftware/asgard/internal/dockerx"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/reclaim"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
@@ -29,7 +30,11 @@ type Deployer struct {
 	// subpaths of Asgard's own data volume rather than host paths.
 	DataDir    string
 	DataVolume string
-	locks      sync.Map
+	// Reclaimer frees the images the previous releases of this project left
+	// behind. A deployment is what creates them, so it is the natural place to
+	// collect the ones that just aged out of the retention window.
+	Reclaimer *reclaim.Reclaimer
+	locks     sync.Map
 }
 type Payload struct {
 	Trigger           string `json:"trigger"`
@@ -330,7 +335,27 @@ func (d *Deployer) switchRelease(ctx context.Context, project store.Project, ser
 			return fmt.Errorf("confirm edge route %s: %w", svc.Name, err)
 		}
 	}
+	d.reclaim(ctx, log)
 	return nil
+}
+
+// reclaim frees images left by releases that have aged past the retention
+// window. It runs only after the release is fully live, and its failure is
+// never the deployment's failure: a disk that could not be tidied is a smaller
+// problem than a release rolled back for it.
+func (d *Deployer) reclaim(ctx context.Context, log func(string)) {
+	if d.Reclaimer == nil {
+		return
+	}
+	result, err := d.Reclaimer.Run(context.WithoutCancel(ctx))
+	if err != nil {
+		log("Storage reclamation skipped: " + err.Error())
+		return
+	}
+	if result.ImagesRemoved == 0 && result.BuildCacheBytes == 0 {
+		return
+	}
+	log("Storage: " + result.Summary())
 }
 
 func releaseToServices(items []store.ReleaseService) []store.Service {

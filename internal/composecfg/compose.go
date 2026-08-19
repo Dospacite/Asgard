@@ -241,9 +241,9 @@ func Parse(data []byte, projectID, projectSlug, root string) (Document, Validati
 		hostname := cfg.Hostname
 		if public && hostname == "" {
 			if name == doc.Asgard.PrimaryService || doc.Asgard.PrimaryService == "" && len(doc.Services) == 1 {
-				hostname = projectSlug + ".asgard.rousoftware.com"
+				hostname = projectSlug + "." + PlaceholderDomain
 			} else {
-				hostname = Slug(name) + "--" + projectSlug + ".asgard.rousoftware.com"
+				hostname = Slug(name) + "--" + projectSlug + "." + PlaceholderDomain
 			}
 		}
 		health := cfg.HealthPath
@@ -551,6 +551,14 @@ func ValidateGitSource(raw string, sshCredential bool) (GitSource, error) {
 }
 
 var hostnamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// PlaceholderDomain stands in for the control plane's wildcard zone while a
+// Compose file is being parsed. Parsing has no configuration in scope, so a
+// service that asks for a public route without naming a hostname gets a name
+// under this placeholder, and the caller — which does know the configured
+// domain — rewrites it before the service is stored. It is a placeholder, not a
+// default: nothing is ever served under it.
+const PlaceholderDomain = "asgard.internal"
 
 // ValidateHostname reports whether value is a bare DNS hostname.
 func ValidateHostname(value string) bool {

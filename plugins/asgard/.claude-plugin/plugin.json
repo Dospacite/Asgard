@@ -7,7 +7,7 @@
   "author": {
     "name": "Rousoftware"
   },
-  "homepage": "https://asgard.rousoftware.com",
+  "homepage": "https://github.com/rousoftware/asgard",
   "keywords": ["deployment", "docker", "compose", "self-hosting", "mcp"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"

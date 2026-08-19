@@ -468,12 +468,14 @@ func rejectServiceRemoval(current, incoming []store.Service, validation *compose
 	return &Problem{Code: "service_removal_blocked", Message: "Compose would remove existing service(s): " + strings.Join(removed, ", ") + ". Remove their lifecycle state through a dedicated service operation first.", Validation: validation}
 }
 
+// adaptDomain rewrites the parse-time placeholder hostnames onto the control
+// plane's configured wildcard zone.
 func adaptDomain(result *composecfg.ValidationResult, domain string) {
-	if domain == "" || domain == "asgard.rousoftware.com" {
+	if domain == "" || domain == composecfg.PlaceholderDomain {
 		return
 	}
 	for index := range result.Services {
-		result.Services[index].Hostname = strings.ReplaceAll(result.Services[index].Hostname, "asgard.rousoftware.com", domain)
+		result.Services[index].Hostname = strings.ReplaceAll(result.Services[index].Hostname, composecfg.PlaceholderDomain, domain)
 	}
 }
 

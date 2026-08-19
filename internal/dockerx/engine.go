@@ -80,14 +80,33 @@ type Host struct {
 }
 
 type Stats struct {
-	CPUPercent  float64   `json:"cpuPercent"`
-	MemoryBytes int64     `json:"memoryBytes"`
-	MemoryLimit int64     `json:"memoryLimit"`
-	NetworkRX   int64     `json:"networkRx"`
-	NetworkTX   int64     `json:"networkTx"`
-	BlockRead   int64     `json:"blockRead"`
-	BlockWrite  int64     `json:"blockWrite"`
-	PIDs        int64     `json:"pids"`
+	CPUPercent  float64 `json:"cpuPercent"`
+	MemoryBytes int64   `json:"memoryBytes"`
+	MemoryLimit int64   `json:"memoryLimit"`
+	NetworkRX   int64   `json:"networkRx"`
+	NetworkTX   int64   `json:"networkTx"`
+	BlockRead   int64   `json:"blockRead"`
+	BlockWrite  int64   `json:"blockWrite"`
+	PIDs        int64   `json:"pids"`
+
+	// CFS throttling counters, cumulative since the container started.
+	//
+	// Average CPU is the wrong statistic for a bursty request-serving workload
+	// under a quota: rendering happens in sub-second bursts that hit the
+	// ceiling and then idle, and any sampling window long enough to be cheap
+	// averages them into noise. A service can report 0.01% CPU while spending
+	// 42% of its scheduling periods stopped at the quota. These counters say so
+	// directly, and Docker has always returned them — Asgard simply dropped
+	// them.
+	CPUPeriods          int64 `json:"cpuPeriods"`
+	CPUThrottledPeriods int64 `json:"cpuThrottledPeriods"`
+	CPUThrottledNanos   int64 `json:"cpuThrottledNanos"`
+	// ThrottledPercent is the share of scheduling periods throttled over the
+	// container's whole life. The collector replaces it with the share over the
+	// last sampling interval, which is what actually answers "is it throttled
+	// right now"; a lifetime figure only ever climbs slowly away from the truth.
+	ThrottledPercent float64 `json:"throttledPercent"`
+
 	CollectedAt time.Time `json:"collectedAt"`
 }
 
@@ -219,7 +238,37 @@ func (e *Engine) Stats(ctx context.Context, id string) (Stats, error) {
 			write += int64(item.Value)
 		}
 	}
-	return Stats{CPUPercent: cpu, MemoryBytes: int64(memory), MemoryLimit: int64(raw.MemoryStats.Limit), NetworkRX: rx, NetworkTX: tx, BlockRead: read, BlockWrite: write, PIDs: int64(raw.PidsStats.Current), CollectedAt: time.Now().UTC()}, nil
+	throttle := raw.CPUStats.ThrottlingData
+	stats := Stats{
+		CPUPercent:          cpu,
+		MemoryBytes:         int64(memory),
+		MemoryLimit:         int64(raw.MemoryStats.Limit),
+		NetworkRX:           rx,
+		NetworkTX:           tx,
+		BlockRead:           read,
+		BlockWrite:          write,
+		PIDs:                int64(raw.PidsStats.Current),
+		CPUPeriods:          int64(throttle.Periods),
+		CPUThrottledPeriods: int64(throttle.ThrottledPeriods),
+		CPUThrottledNanos:   int64(throttle.ThrottledTime),
+		CollectedAt:         time.Now().UTC(),
+	}
+	stats.ThrottledPercent = ThrottledPercent(stats.CPUPeriods, stats.CPUThrottledPeriods)
+	return stats, nil
+}
+
+// ThrottledPercent expresses throttled periods as a share of total periods.
+// Periods is zero when the container has no CPU quota at all, which is not the
+// same as never being throttled, so the answer there is zero rather than a
+// divide by zero.
+func ThrottledPercent(periods, throttled int64) float64 {
+	if periods <= 0 || throttled <= 0 {
+		return 0
+	}
+	if throttled > periods {
+		throttled = periods
+	}
+	return float64(throttled) / float64(periods) * 100
 }
 
 func (e *Engine) Logs(ctx context.Context, id string, tail int, since string) (string, error) {

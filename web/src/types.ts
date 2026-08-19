@@ -1,8 +1,14 @@
 export type Runtime = { dockerId: string; dockerName: string; imageId: string; state: string; active: boolean; createdAt: string; updatedAt: string }
-export type Metrics = { cpuPercent: number; memoryBytes: number; memoryLimit: number; networkRx: number; networkTx: number; blockRead: number; blockWrite: number; pids: number; collectedAt: string }
+export type Metrics = { cpuPercent: number; memoryBytes: number; memoryLimit: number; networkRx: number; networkTx: number; blockRead: number; blockWrite: number; pids: number; cpuThrottledPercent: number; cpuPeriods: number; cpuThrottledPeriods: number; cpuThrottledNanos: number; collectedAt: string }
+// Throttling is reported next to CPU because it is the number that explains a
+// slow service whose average CPU looks idle: bursts saturate the quota for a
+// few hundred milliseconds and vanish into the sampling mean.
+export type Throttling = { samples: number; cpuLimit: number; averagePercent?: number; peakPercent?: number; throttledSamples?: number; windowPeriods?: number; windowThrottled?: number; windowNanos?: number; constrained?: boolean }
+export type ServiceStats = { current?: Metrics; history: Metrics[]; limits: { cpu: number; memoryBytes: number; pids: number }; throttling: Throttling }
 export type NetworkRef = { id: string; slug: string; name: string; dockerName: string; alias: string; internal: boolean }
-export type Service = { id: string; projectId: string; name: string; role: 'web'|'worker'|'stateful'; image: string; buildContext: string; dockerfile: string; command: string[]; environment: Record<string,string>; public: boolean; port: number; hostname: string; healthPath: string; cpuLimit: number; memoryLimit: number; pidsLimit: number; restartPolicy: string; dependsOn: string[]; volumes: string[]; networks?: NetworkRef[]; configRevision: number; runtime?: Runtime; metrics?: Metrics }
-export type GitCredential = { id: string; name: string; kind: 'token'|'ssh'; username?: string; host?: string; hint?: string; createdAt: string; updatedAt: string; lastUsedAt?: string }
+export type Service = { id: string; projectId: string; name: string; role: 'web'|'worker'|'stateful'; image: string; buildContext: string; dockerfile: string; command: string[]; environment: Record<string,string>; public: boolean; port: number; hostname: string; healthPath: string; hstsMode?: ''|'standard'|'strict'|'off'; cpuLimit: number; memoryLimit: number; pidsLimit: number; restartPolicy: string; dependsOn: string[]; volumes: string[]; networks?: NetworkRef[]; configRevision: number; runtime?: Runtime; metrics?: Metrics }
+export type GitCredential = { id: string; name: string; kind: 'token'|'ssh'; username?: string; host?: string; hint?: string; createdAt: string; updatedAt: string; lastUsedAt?: string; lastVerifiedAt?: string; lastVerifyStatus?: 'ok'|'failed'|'skipped'; lastVerifyError?: string; verifyRepository?: string }
+export type VerifyResult = { credentialId: string; status: 'ok'|'failed'|'skipped'; repository?: string; refs?: number; error?: string; checkedAt: string }
 export type Project = { id: string; slug: string; name: string; description: string; sourceType: string; sourceUrl: string; sourceRef: string; sourceCommit?: string; sourceCredentialId?: string; composePath: string; primaryService: string; createdAt: string; updatedAt: string; services: Service[]; status: string }
 export type SourceResync = { project: Project; validation: SourceValidation; commit: string; ref: string; changed: boolean; preservedDotEnv: boolean }
 export type ValidationIssue = { path: string; message: string }
@@ -24,3 +30,12 @@ export type TopologyService = { id:string; projectId:string; projectSlug:string;
 export type TopologyNetwork = { id:string; kind:'edge'|'project'|'shared'; name:string; dockerName:string; description:string; status:string; driver:string; internal:boolean; memberCount:number; subnets:string[] }
 export type TopologyConnection = { id:string; kind:'edge'|'project'|'shared'; networkId:string; projectId:string; serviceId:string; alias:string; status:string; ipv4Address?:string }
 export type NetworkTopology = { projects:TopologyProject[]; services:TopologyService[]; networks:TopologyNetwork[]; connections:TopologyConnection[] }
+
+// A deployment builds the tree captured at import or the last re-sync, so the
+// response names the commit it is actually building and flags a ref that has
+// moved past it. "Push, then deploy" would otherwise ship the old commit with
+// no sign anything was wrong.
+export type SourceStatus = { commit: string; remoteCommit?: string; ref?: string; behind: boolean; checked: boolean; reason?: string }
+export type DeploymentQueued = Operation & { operation: Operation; source?: SourceStatus }
+
+export type System = { host: Host; disk: Disk; goVersion: string; publicUrl: string; domain: string; timezone: string; mcpUrl: string; backupPath: string }

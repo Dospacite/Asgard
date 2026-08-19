@@ -86,6 +86,12 @@ func (i *Importer) FromGit(ctx context.Context, req Request) (store.Project, com
 		ok = true
 		if auth != nil {
 			_ = i.Store.TouchGitCredential(ctx, auth.credential.ID)
+			// The clone just proved this credential reads this repository, so
+			// record it as verified and remember the repository to re-check
+			// against later. Without a remembered repository there is nothing
+			// meaningful to test a token against: token scopes are per
+			// repository, so reaching the host proves nothing.
+			_ = i.Store.RecordGitCredentialVerification(ctx, auth.credential.ID, VerifyOK, "", source.URL)
 		}
 	}
 	return p, result, err
@@ -205,7 +211,7 @@ func (i *Importer) finish(ctx context.Context, p *store.Project, root, composePa
 	p.ComposePath = clean
 	p.PrimaryService = result.PrimaryService
 	for index := range result.Services {
-		result.Services[index].Hostname = strings.ReplaceAll(result.Services[index].Hostname, "asgard.rousoftware.com", i.Domain)
+		result.Services[index].Hostname = strings.ReplaceAll(result.Services[index].Hostname, composecfg.PlaceholderDomain, i.Domain)
 	}
 	if err := i.Store.CreateProject(ctx, *p, result.Services); err != nil {
 		return result, err

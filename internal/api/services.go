@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -37,6 +36,7 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request) {
 		Port           int               `json:"port"`
 		Hostname       string            `json:"hostname"`
 		HealthPath     string            `json:"healthPath"`
+		HSTSMode       string            `json:"hstsMode"`
 		CPULimit       float64           `json:"cpuLimit"`
 		MemoryLimit    int64             `json:"memoryLimit"`
 		PIDsLimit      int64             `json:"pidsLimit"`
@@ -51,54 +51,22 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusPreconditionRequired, "revision_required", err.Error())
 		return
 	}
-	if body.Role != "web" && body.Role != "worker" && body.Role != "stateful" {
-		httpx.Error(w, http.StatusBadRequest, "invalid_role", "Role must be web, worker, or stateful.")
+	settings := composecfg.ServiceSettings{Role: body.Role, Environment: body.Environment, Public: body.Public, Port: body.Port, Hostname: body.Hostname, HealthPath: body.HealthPath, HSTSMode: body.HSTSMode, CPULimit: body.CPULimit, MemoryLimit: body.MemoryLimit, PIDsLimit: body.PIDsLimit, RestartPolicy: body.RestartPolicy}
+	if err := settings.Normalize(s.Config.Domain); err != nil {
+		writeSettingsError(w, err)
 		return
 	}
-	if body.CPULimit < 0.05 || body.CPULimit > 64 || body.MemoryLimit < 32<<20 || body.MemoryLimit > 256<<30 || body.PIDsLimit < 16 || body.PIDsLimit > 32768 {
-		httpx.Error(w, http.StatusBadRequest, "invalid_resources", "Resource limits are outside the supported range.")
-		return
-	}
-	if body.RestartPolicy != "no" && body.RestartPolicy != "always" && body.RestartPolicy != "on-failure" && body.RestartPolicy != "unless-stopped" {
-		httpx.Error(w, http.StatusBadRequest, "invalid_restart_policy", "Unsupported restart policy.")
-		return
-	}
-	if err := composecfg.ValidateEnvironment(body.Environment); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid_environment", err.Error())
-		return
-	}
-	body.Hostname = strings.ToLower(strings.TrimSpace(body.Hostname))
-	if body.Public {
-		if body.Port < 1 || body.Port > 65535 {
-			httpx.Error(w, http.StatusBadRequest, "invalid_port", "A public service needs a valid internal port.")
-			return
-		}
-		switch err := composecfg.ValidatePublicHostname(body.Hostname, s.Config.Domain); {
-		case errors.Is(err, composecfg.ErrHostnameReserved):
-			httpx.Error(w, http.StatusConflict, "reserved_hostname", "The control-plane hostname is reserved.")
-			return
-		case err != nil:
-			httpx.Error(w, http.StatusBadRequest, "invalid_hostname", "Hostname must be a fully qualified DNS name, such as app.example.com, whose DNS points at this host.")
-			return
-		}
-	}
-	if body.HealthPath == "" {
-		body.HealthPath = "/"
-	}
-	if !strings.HasPrefix(body.HealthPath, "/") {
-		httpx.Error(w, http.StatusBadRequest, "invalid_health_path", "Health path must begin with /.")
-		return
-	}
-	current.Role = body.Role
-	current.Environment = body.Environment
-	current.Public = body.Public
-	current.Port = body.Port
-	current.Hostname = body.Hostname
-	current.HealthPath = body.HealthPath
-	current.CPULimit = body.CPULimit
-	current.MemoryLimit = body.MemoryLimit
-	current.PIDsLimit = body.PIDsLimit
-	current.RestartPolicy = body.RestartPolicy
+	current.Role = settings.Role
+	current.Environment = settings.Environment
+	current.Public = settings.Public
+	current.Port = settings.Port
+	current.Hostname = settings.Hostname
+	current.HealthPath = settings.HealthPath
+	current.HSTSMode = settings.HSTSMode
+	current.CPULimit = settings.CPULimit
+	current.MemoryLimit = settings.MemoryLimit
+	current.PIDsLimit = settings.PIDsLimit
+	current.RestartPolicy = settings.RestartPolicy
 	if err := s.Store.UpdateService(r.Context(), current, revision); err != nil {
 		httpx.Error(w, http.StatusConflict, "revision_conflict", err.Error())
 		return
@@ -117,7 +85,10 @@ func (s *Server) serviceStats(w http.ResponseWriter, r *http.Request) {
 	}
 	if service.Runtime != nil && service.Runtime.State == "running" {
 		if live, liveErr := s.Docker.Stats(r.Context(), service.Runtime.DockerID); liveErr == nil {
-			service.Metrics = &store.Metrics{CPUPercent: live.CPUPercent, MemoryBytes: live.MemoryBytes, MemoryLimit: live.MemoryLimit, NetworkRX: live.NetworkRX, NetworkTX: live.NetworkTX, BlockRead: live.BlockRead, BlockWrite: live.BlockWrite, PIDs: live.PIDs, CollectedAt: live.CollectedAt}
+			// A live read has no previous sample to difference against, so its
+			// throttling share is the container's lifetime figure. The stored
+			// history below carries the per-interval share.
+			service.Metrics = &store.Metrics{CPUPercent: live.CPUPercent, MemoryBytes: live.MemoryBytes, MemoryLimit: live.MemoryLimit, NetworkRX: live.NetworkRX, NetworkTX: live.NetworkTX, BlockRead: live.BlockRead, BlockWrite: live.BlockWrite, PIDs: live.PIDs, CPUThrottledPercent: live.ThrottledPercent, CPUPeriods: live.CPUPeriods, CPUThrottledPeriods: live.CPUThrottledPeriods, CPUThrottledNanos: live.CPUThrottledNanos, CollectedAt: live.CollectedAt}
 		}
 	}
 	since := time.Now().UTC().Add(-2 * time.Hour)
@@ -126,24 +97,12 @@ func (s *Server) serviceStats(w http.ResponseWriter, r *http.Request) {
 			since = parsed
 		}
 	}
-	rows, err := s.Store.DB.QueryContext(r.Context(), `SELECT cpu_percent,memory_bytes,memory_limit,network_rx,network_tx,block_read,block_write,pids,collected_at FROM metrics WHERE service_id=? AND collected_at>=? ORDER BY collected_at LIMIT 1000`, service.ID, since.Format(time.RFC3339Nano))
+	history, err := s.Store.RecentMetrics(r.Context(), service.ID, since, 1000)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	defer rows.Close()
-	history := []store.Metrics{}
-	for rows.Next() {
-		var m store.Metrics
-		var collected string
-		if err := rows.Scan(&m.CPUPercent, &m.MemoryBytes, &m.MemoryLimit, &m.NetworkRX, &m.NetworkTX, &m.BlockRead, &m.BlockWrite, &m.PIDs, &collected); err != nil {
-			writeError(w, err)
-			return
-		}
-		m.CollectedAt, _ = time.Parse(time.RFC3339Nano, collected)
-		history = append(history, m)
-	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"current": service.Metrics, "history": history, "limits": map[string]any{"cpu": service.CPULimit, "memoryBytes": service.MemoryLimit, "pids": service.PIDsLimit}})
+	httpx.JSON(w, http.StatusOK, map[string]any{"current": service.Metrics, "history": history, "limits": map[string]any{"cpu": service.CPULimit, "memoryBytes": service.MemoryLimit, "pids": service.PIDsLimit}, "throttling": store.ThrottlingSummary(history, service.CPULimit)})
 }
 
 func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request) {
@@ -189,4 +148,20 @@ func latestRuntimeID(db *sql.DB, serviceID string) (string, error) {
 	var id string
 	err := db.QueryRow(`SELECT docker_id FROM runtime_containers WHERE service_id=? AND active=1`, serviceID).Scan(&id)
 	return id, err
+}
+
+// writeSettingsError maps a shared validation failure onto its HTTP status.
+// The mapping lives with the transport; the rules themselves live in
+// composecfg so the MCP server enforces exactly the same ones.
+func writeSettingsError(w http.ResponseWriter, err error) {
+	var settings *composecfg.SettingsError
+	if !errors.As(err, &settings) {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusBadRequest
+	if settings.Code == "reserved_hostname" {
+		status = http.StatusConflict
+	}
+	httpx.Error(w, status, settings.Code, settings.Message)
 }

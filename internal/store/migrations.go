@@ -349,7 +349,39 @@ PRAGMA user_version = 3;
 // SQLite has no IF NOT EXISTS for ADD COLUMN, so each is probed first.
 var addedColumns = []struct{ table, column, definition string }{
 	{"projects", "source_credential_id", "TEXT NOT NULL DEFAULT ''"},
+	// CFS throttling counters, so a service that is pinned against its CPU
+	// quota in short bursts is visible instead of averaging away to nothing.
+	// cpu_throttled_percent is the share over one collection interval, derived
+	// from the delta against the previous sample; the raw counters are
+	// cumulative since container start and are kept so the derivation stays
+	// auditable.
+	{"metrics", "cpu_periods", "INTEGER NOT NULL DEFAULT 0"},
+	{"metrics", "cpu_throttled_periods", "INTEGER NOT NULL DEFAULT 0"},
+	{"metrics", "cpu_throttled_nanos", "INTEGER NOT NULL DEFAULT 0"},
+	{"metrics", "cpu_throttled_percent", "REAL NOT NULL DEFAULT 0"},
+	// Credential verification results. A stored credential that has never been
+	// exercised is only a guess; these record the last time one was actually
+	// proven to work and why it stopped.
+	{"git_credentials", "last_verified_at", "TEXT"},
+	{"git_credentials", "last_verify_status", "TEXT NOT NULL DEFAULT ''"},
+	{"git_credentials", "last_verify_error", "TEXT NOT NULL DEFAULT ''"},
+	{"git_credentials", "verify_repository", "TEXT NOT NULL DEFAULT ''"},
+	// Per-route HSTS policy, kept on the service because the deployer drops and
+	// recreates a project's routes on every release. Empty means "decide from
+	// the zone": names inside the control plane's own wildcard domain keep the
+	// strong preload-ready header, anything else gets a plain max-age.
+	{"services", "hsts_mode", "TEXT NOT NULL DEFAULT ''"},
 	// Records the commit a Git import or re-sync captured, so operators can see
 	// which revision the working tree that deployments build actually holds.
 	{"projects", "source_commit", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// addedIndexes run after addedColumns, because an index over a column that a
+// migration has just added cannot be declared in the base schema — that runs
+// first, when the column does not exist yet.
+var addedIndexes = []string{
+	// The collector differences each sample against the container's previous
+	// one to get the throttled share over the interval. Without this it scans
+	// every retained row for the container on every collection tick.
+	`CREATE INDEX IF NOT EXISTS metrics_container_time_idx ON metrics(container_id, collected_at)`,
 }

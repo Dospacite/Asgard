@@ -37,7 +37,16 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) system(w http.ResponseWriter, r *http.Request) {
 	host := s.Docker.Host(r.Context())
-	httpx.JSON(w, http.StatusOK, map[string]any{"host": host, "disk": diskUsage(s.Config.DataDir), "goVersion": runtime.Version(), "publicUrl": s.Config.PublicURL, "domain": s.Config.Domain, "timezone": s.Config.Timezone.String(), "mcpUrl": s.Config.PublicURL + "/mcp", "backupPath": s.Config.BackupsDir})
+	// The retention policy is reported alongside the disk figures because it is
+	// the setting that explains them: it is what bounds image growth, and how
+	// far back a rollback can still reach.
+	storage := map[string]any{
+		"keepReleaseImages":    s.Config.KeepReleaseImages,
+		"buildCacheBytes":      s.Config.BuildCacheBytes,
+		"reclaimIntervalHours": int(s.Config.ReclaimInterval.Hours()),
+		"automatic":            s.Config.ReclaimInterval > 0,
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"host": host, "disk": diskUsage(s.Config.DataDir), "goVersion": runtime.Version(), "publicUrl": s.Config.PublicURL, "domain": s.Config.Domain, "timezone": s.Config.Timezone.String(), "mcpUrl": s.Config.PublicURL + "/mcp", "backupPath": s.Config.BackupsDir, "storage": storage})
 }
 
 func diskUsage(path string) map[string]any {

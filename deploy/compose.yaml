@@ -1,5 +1,7 @@
 name: asgard
 services:
+  # Renders Traefik's static and control-plane configuration from deploy/.env so
+  # nothing in the repository carries a particular deployment's domain or email.
   traefik-config-init:
     image: alpine:3.23
     restart: "no"
@@ -7,16 +9,14 @@ services:
     labels:
       com.rousoftware.asgard.managed: "true"
       com.rousoftware.asgard.system: control-plane
-    command:
-      - sh
-      - -eu
-      - -c
-      - |
-        mkdir -p /data/traefik/dynamic
-        cp /config/control-plane.yml /data/traefik/dynamic/control-plane.yml
-        chmod 0644 /data/traefik/dynamic/control-plane.yml
+    env_file:
+      - path: .env
+        required: false
+    command: ["sh", "/config/render-config.sh"]
     volumes:
-      - ./dynamic/control-plane.yml:/config/control-plane.yml:ro
+      - ./render-config.sh:/config/render-config.sh:ro
+      - ./dynamic/control-plane.yml.template:/config/control-plane.yml.template:ro
+      - ./traefik.yaml.template:/config/traefik.yaml.template:ro
       - asgard-data:/data
     security_opt: [no-new-privileges:true]
   traefik:
@@ -25,12 +25,11 @@ services:
     labels:
       com.rousoftware.asgard.managed: "true"
       com.rousoftware.asgard.system: control-plane
-    command: ["--configFile=/etc/traefik/traefik.yml"]
+    command: ["--configFile=/data/traefik/traefik.yml"]
     ports:
       - "0.0.0.0:80:80"
       - "0.0.0.0:443:443"
     volumes:
-      - ./traefik.yaml:/etc/traefik/traefik.yml:ro
       - asgard-data:/data:ro
       - traefik-data:/letsencrypt
     networks: [asgard-management, asgard-edge]

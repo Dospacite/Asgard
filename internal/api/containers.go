@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -79,17 +78,19 @@ func (s *Server) adoptContainer(w http.ResponseWriter, r *http.Request) {
 	if body.Role == "" {
 		body.Role = "web"
 	}
-	if body.Role != "web" && body.Role != "worker" && body.Role != "stateful" {
-		httpx.Error(w, http.StatusBadRequest, "invalid_role", "Role must be web, worker, or stateful.")
+	if err := composecfg.ValidateRole(body.Role); err != nil {
+		writeSettingsError(w, err)
 		return
 	}
-	body.Hostname = strings.ToLower(strings.TrimSpace(body.Hostname))
-	if body.Public && (body.Port < 1 || body.Port > 65535 || composecfg.ValidatePublicHostname(body.Hostname, s.Config.Domain) != nil) {
-		httpx.Error(w, http.StatusBadRequest, "invalid_route", "Public adoption needs a valid port and a fully qualified hostname that is not the control plane's own.")
+	body.Hostname, err = composecfg.NormalizeRoute(body.Public, body.Port, body.Hostname, s.Config.Domain)
+	if err != nil {
+		writeSettingsError(w, err)
 		return
 	}
-	if body.HealthPath == "" {
-		body.HealthPath = "/"
+	body.HealthPath, err = composecfg.NormalizeHealthPath(body.HealthPath)
+	if err != nil {
+		writeSettingsError(w, err)
+		return
 	}
 	serviceID := uuid.NewString()
 	result, err := s.Docker.Adopt(r.Context(), containerID, dockerx.AdoptionRequest{ProjectID: project.ID, ProjectSlug: project.Slug, ServiceID: serviceID, ServiceName: body.ServiceName})

@@ -30,7 +30,7 @@ func TestNestedProjectReadsReleaseDatabaseConnection(t *testing.T) {
 		Role:          "web",
 		Image:         "traefik/whoami:v1.11.0",
 		Port:          80,
-		Hostname:      "example.asgard.rousoftware.com",
+		Hostname:      "example.asgard.example.com",
 		HealthPath:    "/",
 		CPULimit:      0.5,
 		MemoryLimit:   512 << 20,

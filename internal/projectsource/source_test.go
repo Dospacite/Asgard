@@ -86,7 +86,7 @@ x-asgard:
       role: worker
       public: false
 `
-	if _, err := Save(context.Background(), database, project, "asgard.rousoftware.com", compose.Path, updated, compose.Revision); err != nil {
+	if _, err := Save(context.Background(), database, project, "asgard.example.com", compose.Path, updated, compose.Revision); err != nil {
 		t.Fatal(err)
 	}
 
@@ -123,14 +123,14 @@ func TestSaveRejectsStaleRevisionAndServiceRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	compose := workspace.Files[0]
-	if _, err := Save(context.Background(), database, project, "asgard.rousoftware.com", compose.Path, compose.Content, "stale"); problemCode(err) != "source_revision_conflict" {
+	if _, err := Save(context.Background(), database, project, "asgard.example.com", compose.Path, compose.Content, "stale"); problemCode(err) != "source_revision_conflict" {
 		t.Fatalf("stale save error = %v", err)
 	}
 	removal := `services:
   replacement:
     image: nginx:1.27
 `
-	if _, err := Save(context.Background(), database, project, "asgard.rousoftware.com", compose.Path, removal, compose.Revision); problemCode(err) != "service_removal_blocked" {
+	if _, err := Save(context.Background(), database, project, "asgard.example.com", compose.Path, removal, compose.Revision); problemCode(err) != "service_removal_blocked" {
 		t.Fatalf("removal save error = %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(project.SourcePath, project.ComposePath))

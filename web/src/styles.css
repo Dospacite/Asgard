@@ -152,6 +152,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .alert p { margin: 3px 0 0; color: var(--ink-55); font-size: 12px; }
 .alert--error { color: var(--error); border-color: rgba(196,40,77,.2); background: rgba(196,40,77,.07); }
 .alert--success { margin-bottom: 20px; color: var(--success); border-color: rgba(23,107,80,.18); background: rgba(23,107,80,.07); }
+.alert--warn { margin-bottom: 20px; color: var(--orange); border-color: rgba(198,63,0,.28); background: rgba(198,63,0,.07); }
 
 .back-link { min-height: 36px; margin: -10px 0 14px; padding: 0; border: 0; display: inline-flex; align-items: center; gap: 7px; color: var(--ink-55); background: transparent; text-decoration: none; font-size: 12px; font-weight: 600; cursor: pointer; }
 .back-link:hover { color: var(--orange); }
@@ -204,6 +205,12 @@ td a:hover { text-decoration: underline; }
 .service-meta a:hover { color: var(--orange); }
 .service-meta svg { width: 13px; }
 .metric-grid--service { margin-bottom: 20px; }
+/* A service pinned against its CPU quota reads as idle on the CPU tile, so the
+   throttling tile carries the emphasis when it is the constraint. */
+.metric--warn strong { color: var(--orange); }
+.metric--warn::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--orange); }
+.throttle-note { margin: -8px 0 0; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--ink-10); color: var(--ink-72); background: rgba(38,37,30,.03); font-size: 12px; line-height: 1.55; }
+.throttle-note--warn { border-color: rgba(198,63,0,.35); color: var(--ink); background: rgba(198,63,0,.06); }
 .chart-panel { overflow: hidden; }
 .chart { height: 320px; padding: 14px 14px 8px; }
 .chart-empty { min-height: 260px; padding: 32px; display: grid; place-items: center; color: var(--ink-55); text-align: center; }
@@ -354,11 +361,24 @@ label small { color: var(--ink-55); font-size: 10px; font-weight: 500; }
 .inline-hint { display: inline-flex; align-items: center; gap: 5px; }
 .inline-hint svg { width: 12px; }
 .credential-list { margin: 14px 0 0; padding: 0 10px; list-style: none; }
-.credential-list li { min-height: 62px; padding: 12px 10px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--ink-10); }
+.credential-list li { min-height: 62px; padding: 12px 10px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--ink-10); }
+.credential-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.credential-row > div:first-child { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.credential-error { color: var(--orange); overflow-wrap: anywhere; }
+/* Verification state leads each row: "last used" alone reads green for a
+   credential that worked somewhere else and fails here. */
+.verify { display: inline-flex; align-items: center; gap: 4px; font-weight: 650; }
+.verify svg { width: 12px; height: 12px; }
+.verify--ok { color: var(--green, #176b50); }
+.verify--bad { color: var(--orange); }
+.verify--unknown { color: var(--ink-55); }
 .credential-list li:last-child { border-bottom-color: transparent; }
-.credential-list li > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+
 .credential-list strong { font-size: 13px; }
 .credential-list small { color: var(--ink-55); font-size: 11px; overflow-wrap: anywhere; }
+.reclaim-list { margin: 10px 0 0; padding: 0 0 0 2px; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.reclaim-list li { font-size: 11px; overflow-wrap: anywhere; }
+.reclaim-list code { font-size: 11px; }
 .credential-form { padding: 4px 20px 20px; }
 .credential-form .form-actions { margin-top: 16px; }
 .panel > .button { margin: 4px 20px 20px; }

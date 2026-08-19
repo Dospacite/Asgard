@@ -164,4 +164,4 @@ function sameEnvironment(left:Record<string,string>,right:Record<string,string>)
   return leftKeys.length===rightKeys.length&&leftKeys.every((key,index)=>key===rightKeys[index]&&left[key]===right[key])
 }
 
-function servicePayload(service:Service,environment:Record<string,string>){return {role:service.role,environment,public:service.public,port:service.port,hostname:service.hostname,healthPath:service.healthPath,cpuLimit:service.cpuLimit,memoryLimit:service.memoryLimit,pidsLimit:service.pidsLimit,restartPolicy:service.restartPolicy,configRevision:service.configRevision}}
+function servicePayload(service:Service,environment:Record<string,string>){return {role:service.role,environment,public:service.public,port:service.port,hostname:service.hostname,healthPath:service.healthPath,hstsMode:service.hstsMode??'',cpuLimit:service.cpuLimit,memoryLimit:service.memoryLimit,pidsLimit:service.pidsLimit,restartPolicy:service.restartPolicy,configRevision:service.configRevision}}

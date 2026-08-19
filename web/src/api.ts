@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query'
+import type { System } from './types'
 const API = '/api/v1'
 
 export class APIError extends Error { constructor(public status:number, public code:string, message:string, public details?:unknown){super(message)} }
@@ -28,5 +30,24 @@ export const api={
   get:<T>(path:string)=>request<T>(path),
   post:<T>(path:string,body?:unknown,headers?:HeadersInit)=>request<T>(path,{method:'POST',body:body instanceof FormData?body:body===undefined?undefined:JSON.stringify(body),headers}),
   patch:<T>(path:string,body:unknown,headers?:HeadersInit)=>request<T>(path,{method:'PATCH',body:JSON.stringify(body),headers}),
+  put:<T>(path:string,body:unknown,headers?:HeadersInit)=>request<T>(path,{method:'PUT',body:JSON.stringify(body),headers}),
   del:<T>(path:string,body?:unknown)=>request<T>(path,{method:'DELETE',body:body===undefined?undefined:JSON.stringify(body)}),
+}
+
+// useDomain returns the wildcard domain this control plane is configured with.
+// Hostnames are an operator setting, not a constant: a self-hosted install runs
+// under its own zone, so nothing in the UI may assume a particular one. React
+// Query dedupes the shared 'system' key, so every caller costs one request.
+export function useDomain(){
+  const query=useQuery({queryKey:['system'],queryFn:()=>api.get<System>('/system'),staleTime:5*60_000})
+  return query.data?.domain??''
+}
+
+// projectHostname is the name a project is reachable at: the hostname its
+// public service actually claims, or the default derived from the slug when it
+// has none yet.
+export function projectHostname(project:{slug:string;services?:{public:boolean;hostname:string}[]},domain:string){
+  const claimed=project.services?.find(service=>service.public&&service.hostname)?.hostname
+  if(claimed)return claimed
+  return domain?`${project.slug}.${domain}`:project.slug
 }

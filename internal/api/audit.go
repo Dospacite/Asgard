@@ -147,7 +147,17 @@ func (s *Server) deletionConfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = s.Proxy.Write(r.Context())
-		s.auditRequest(r, "project.delete", "project", project.ID, "Deleted project; named volumes retained")
+		// Every image this project ever built is now unreachable: the retention
+		// policy is keyed on a project row that no longer exists, so nothing
+		// else would ever collect them. Deleting a project used to leave
+		// gigabytes behind for exactly this reason.
+		summary := "Deleted project; named volumes retained"
+		if s.Reclaimer != nil {
+			if freed, reclaimErr := s.Reclaimer.ForgetProject(r.Context(), project.Slug); reclaimErr == nil && freed.ImagesRemoved > 0 {
+				summary += "; " + freed.Summary()
+			}
+		}
+		s.auditRequest(r, "project.delete", "project", project.ID, summary)
 	case "container":
 		if err := s.Docker.Remove(r.Context(), targetID, false); err != nil {
 			httpx.Error(w, http.StatusBadGateway, "docker_error", err.Error())

@@ -1,0 +1,30 @@
+# Rendered into the data volume at startup by traefik-config-init.
+# Placeholders are filled from deploy/.env — edit that file, not this one.
+http:
+  routers:
+    asgard-control:
+      rule: Host(`__CONTROL_HOSTNAME__`)
+      entryPoints: [websecure]
+      service: asgard-control
+      middlewares: [asgard-security]
+      tls:
+        certResolver: letsencrypt
+  services:
+    asgard-control:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://asgard:8080
+  middlewares:
+    asgard-security:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: strict-origin-when-cross-origin
+        stsSeconds: 31536000
+        # includeSubDomains and preload commit every subdomain of this name to
+        # HTTPS-only, and preload-list removal takes months. That is only safe
+        # when the control plane sits on a name it owns outright, so it is
+        # enabled for a subdomain of ASGARD_DOMAIN and off on a bare apex.
+        stsIncludeSubdomains: __HSTS_SUBDOMAINS__
+        stsPreload: __HSTS_PRELOAD__

@@ -1,3 +1,5 @@
+# Rendered into the data volume at startup by traefik-config-init.
+# __ACME_EMAIL__ comes from ASGARD_ACME_EMAIL in deploy/.env.
 global:
   checkNewVersion: false
   sendAnonymousUsage: false
@@ -41,7 +43,7 @@ providers:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: ege@rousoftware.com
+      email: __ACME_EMAIL__
       storage: /letsencrypt/acme.json
       httpChallenge:
         entryPoint: web

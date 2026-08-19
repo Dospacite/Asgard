@@ -25,6 +25,7 @@ import (
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/projectsource"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/reclaim"
 	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
@@ -38,6 +39,7 @@ type Dependencies struct {
 	Importer   *importer.Importer
 	Proxy      *proxy.Generator
 	Secrets    *secrets.Box
+	Reclaimer  *reclaim.Reclaimer
 }
 type Server struct {
 	Dependencies
@@ -85,11 +87,28 @@ type GitImportInput struct {
 	ComposePath  string `json:"composePath,omitempty"`
 }
 type GitCredentialCreateInput struct {
-	Name     string `json:"name" jsonschema:"required,human-readable credential name"`
-	Kind     string `json:"kind" jsonschema:"required,token for HTTPS or ssh for a deploy key"`
-	Secret   string `json:"secret" jsonschema:"required,the access token or PEM-encoded private key; stored encrypted and never returned"`
-	Username string `json:"username,omitempty" jsonschema:"HTTPS username; defaults to x-access-token"`
-	Host     string `json:"host,omitempty" jsonschema:"optional bare hostname this credential belongs to, such as github.com"`
+	Name       string `json:"name" jsonschema:"required,human-readable credential name"`
+	Kind       string `json:"kind" jsonschema:"required,token for HTTPS or ssh for a deploy key"`
+	Secret     string `json:"secret" jsonschema:"required,the access token or PEM-encoded private key; stored encrypted and never returned"`
+	Username   string `json:"username,omitempty" jsonschema:"HTTPS username; defaults to x-access-token"`
+	Host       string `json:"host,omitempty" jsonschema:"optional bare hostname this credential belongs to, such as github.com"`
+	Repository string `json:"repository,omitempty" jsonschema:"repository URL to prove the credential against with git ls-remote, now and on every later re-check; without one the credential cannot be verified and will only be tested when a deployment needs it"`
+}
+type GitCredentialUpdateInput struct {
+	ID         string `json:"id" jsonschema:"required,credential identifier or name"`
+	Secret     string `json:"secret,omitempty" jsonschema:"replacement token or PEM-encoded private key; omit to change only metadata"`
+	Name       string `json:"name,omitempty" jsonschema:"new credential name"`
+	Username   string `json:"username,omitempty" jsonschema:"HTTPS username; defaults to x-access-token"`
+	Host       string `json:"host,omitempty" jsonschema:"optional bare hostname this credential belongs to"`
+	Repository string `json:"repository,omitempty" jsonschema:"repository URL to prove the rotated credential against"`
+}
+type GitCredentialVerifyInput struct {
+	ID         string `json:"id,omitempty" jsonschema:"credential identifier or name; omit to re-check every stored credential"`
+	Repository string `json:"repository,omitempty" jsonschema:"repository URL to test against; defaults to the credential's remembered one"`
+}
+type ProjectCredentialInput struct {
+	ProjectID    string `json:"projectId" jsonschema:"required,project identifier or slug"`
+	CredentialID string `json:"credentialId" jsonschema:"credential identifier or name to use for this project's clones; empty detaches the credential and treats the repository as public"`
 }
 type ImageImportInput struct {
 	Name        string `json:"name" jsonschema:"required,project display name"`
@@ -112,10 +131,15 @@ type ConfigInput struct {
 	Port           int               `json:"port"`
 	Hostname       string            `json:"hostname,omitempty"`
 	HealthPath     string            `json:"healthPath"`
+	HSTSMode       string            `json:"hstsMode,omitempty" jsonschema:"HSTS policy for the public route: empty derives it from the hostname (strong inside the control plane's own domain, plain max-age elsewhere), standard sends max-age for this host only, strict adds includeSubDomains and preload and commits every subdomain of the domain, off sends no header"`
 	CPULimit       float64           `json:"cpuLimit"`
 	MemoryLimit    int64             `json:"memoryLimit"`
 	PIDsLimit      int64             `json:"pidsLimit"`
 	RestartPolicy  string            `json:"restartPolicy"`
+}
+type ReclaimInput struct {
+	DryRun       bool `json:"dryRun,omitempty" jsonschema:"report what would be freed without freeing it"`
+	KeepReleases int  `json:"keepReleases,omitempty" jsonschema:"override how many recent releases keep their images; this is how far back a rollback can still reach,minimum=1,maximum=50"`
 }
 type NetworkInput struct {
 	NetworkID string `json:"networkId" jsonschema:"required,managed network identifier or slug"`
@@ -202,7 +226,7 @@ func (s *Server) addTools() {
 		item, err := s.Store.GetService(ctx, in.ServiceID)
 		return nil, item, err
 	})
-	mcp.AddTool(s.MCP, readTool("service_stats_get", "Get service metrics", "Return live and recent CPU, RAM, I/O, network, and PID metrics."), func(ctx context.Context, _ *mcp.CallToolRequest, in ServiceInput) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(s.MCP, readTool("service_stats_get", "Get service metrics", "Return live and recent CPU, RAM, I/O, network, PID, and CPU-throttling metrics. Read the throttling summary before concluding a service is idle: a request-serving workload bursts against its CPU quota in well under a second, so it can average near-zero CPU while being stopped at the ceiling in a large share of scheduling periods."), func(ctx context.Context, _ *mcp.CallToolRequest, in ServiceInput) (*mcp.CallToolResult, any, error) {
 		if err := require(ctx, "asgard:read"); err != nil {
 			return nil, nil, err
 		}
@@ -216,7 +240,11 @@ func (s *Server) addTools() {
 				live = stats
 			}
 		}
-		return nil, map[string]any{"current": live, "limits": map[string]any{"cpu": item.CPULimit, "memoryBytes": item.MemoryLimit, "pids": item.PIDsLimit}}, nil
+		history, err := s.Store.RecentMetrics(ctx, item.ID, time.Now().UTC().Add(-2*time.Hour), 1000)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, map[string]any{"current": live, "limits": map[string]any{"cpu": item.CPULimit, "memoryBytes": item.MemoryLimit, "pids": item.PIDsLimit}, "throttling": store.ThrottlingSummary(history, item.CPULimit)}, nil
 	})
 	mcp.AddTool(s.MCP, readTool("service_logs_get", "Get service logs", "Return bounded recent logs from the active service container."), func(ctx context.Context, _ *mcp.CallToolRequest, in LogsInput) (*mcp.CallToolResult, any, error) {
 		if err := require(ctx, "asgard:read"); err != nil {
@@ -281,11 +309,15 @@ func (s *Server) addTools() {
 		return nil, map[string]any{"items": items}, err
 	})
 	mcp.AddTool(s.MCP, writeTool("git_credential_create", "Store a Git credential", "Encrypt and store an access token or SSH deploy key so private repositories can be imported. The secret is write-only.", false, false, false), s.createGitCredential)
+	mcp.AddTool(s.MCP, writeTool("storage_reclaim", "Reclaim disk", "Free Docker artifacts Asgard created: images from releases past the retention window, images of deleted projects, untagged layers, and build cache over budget. Images backing the most recent releases and anything a container references are never removed, so rollback targets survive. Pass dryRun to see what would go first.", false, false, false), s.reclaimStorage)
+	mcp.AddTool(s.MCP, writeTool("git_credential_update", "Rotate a Git credential", "Replace a stored credential's secret in place, keeping its id so every project already using it picks up the new secret. This is how an expired or leaked token is replaced; creating a new credential instead leaves projects pointing at the old one. Omit the secret to change only metadata. The rotated credential is verified before the call returns.", false, false, false), s.updateGitCredential)
+	mcp.AddTool(s.MCP, readTool("git_credential_verify", "Verify Git credentials", "Prove a stored credential can still read its repository with git ls-remote, and record the result. Omit the id to re-check every credential. A credential that has never been verified is only a guess: lastUsedAt can be recent because it worked for a different project while being unable to read this one."), s.verifyGitCredential)
+	mcp.AddTool(s.MCP, writeTool("project_credential_set", "Set a project's Git credential", "Point a Git-imported project at a different stored credential, or at none. Needed to complete a credential rotation, and to attach a credential to a project imported before it existed.", false, false, false), s.setProjectCredential)
 	mcp.AddTool(s.MCP, writeTool("git_credential_delete", "Delete a Git credential", "Remove a stored Git credential. Projects already imported with it keep their source.", true, true, false), s.deleteGitCredential)
 	mcp.AddTool(s.MCP, writeTool("project_import_image", "Import public OCI image", "Create a project from a public OCI image or Docker Hub URL.", false, false, true), s.importImage)
 	mcp.AddTool(s.MCP, writeTool("project_source_update", "Update project source file", "Revision-check, validate, and replace one editable Compose, Dockerfile, or .env file. Compose saves reconcile source-owned service fields while preserving runtime overrides.", true, false, false), s.updateProjectSource)
 	mcp.AddTool(s.MCP, writeTool("project_source_resync", "Re-sync project source from Git", "Re-clone a Git-imported project's repository and replace its working tree, so the next deployment builds the branch's current head instead of the commit captured at import. Returns the synced commit. Deployments do not fetch on their own: call this first whenever new commits should go live. The project's .env is preserved and runtime overrides survive; an invalid incoming Compose file leaves the running project untouched.", true, false, true), s.resyncProjectSource)
-	mcp.AddTool(s.MCP, writeTool("deployment_create", "Deploy project", "Queue an idempotent, health-gated versioned deployment and return its operation.", true, false, true), s.deploy)
+	mcp.AddTool(s.MCP, writeTool("deployment_create", "Deploy project", "Queue an idempotent, health-gated versioned deployment and return its operation. The response names the commit being built: a deployment rebuilds the tree captured at import or the last project_source_resync, so if you have just pushed, check source.behind and re-sync before deploying.", true, false, true), s.deploy)
 	mcp.AddTool(s.MCP, writeTool("deployment_rollback", "Roll back project", "Queue recreation of an earlier successful release and atomically switch traffic.", true, false, false), s.rollback)
 	mcp.AddTool(s.MCP, writeTool("service_config_update", "Update service configuration", "Update limits, public route, environment, role, and restart behavior with revision protection.", true, false, false), s.updateConfig)
 	mcp.AddTool(s.MCP, writeTool("container_action", "Act on service container", "Start, stop, or restart the active service container.", false, false, false), s.containerAction)
@@ -447,7 +479,7 @@ func (s *Server) createGitCredential(ctx context.Context, _ *mcp.CallToolRequest
 	if s.Secrets == nil {
 		return nil, nil, errors.New("credential storage is unavailable")
 	}
-	item, secret, err := store.NormalizeGitCredential(in.Name, in.Kind, in.Username, in.Host, in.Secret)
+	item, secret, err := store.NormalizeGitCredential(in.Name, in.Kind, in.Username, in.Host, in.Secret, in.Repository)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -456,10 +488,129 @@ func (s *Server) createGitCredential(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, nil, err
 	}
 	created, err := s.Store.CreateGitCredential(ctx, item, ciphertext, nonce)
-	if err == nil {
-		audit(ctx, s.Store, "git_credential.create", "git_credential", created.ID, "Agent stored "+created.Kind+" credential "+created.Name)
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, created, err
+	audit(ctx, s.Store, "git_credential.create", "git_credential", created.ID, "Agent stored "+created.Kind+" credential "+created.Name)
+	// Prove it now. A credential that is only tested when a release needs it is
+	// a release that fails at the worst moment.
+	return nil, s.verifiedCredential(ctx, created.ID, in.Repository), nil
+}
+
+// updateGitCredential rotates a stored credential in place, keeping its id so
+// every project already pointing at it picks up the new secret.
+func (s *Server) updateGitCredential(ctx context.Context, _ *mcp.CallToolRequest, in GitCredentialUpdateInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:configure"); err != nil {
+		return nil, nil, err
+	}
+	current, err := s.Store.GetGitCredential(ctx, in.ID)
+	if err != nil {
+		return nil, nil, errors.New("git credential not found")
+	}
+	name := in.Name
+	if name == "" {
+		name = current.Name
+	}
+	item, secret, err := store.NormalizeGitCredentialUpdate(current, name, in.Username, in.Host, in.Secret, in.Repository)
+	if err != nil {
+		return nil, nil, err
+	}
+	var ciphertext, nonce []byte
+	if secret != nil {
+		if s.Secrets == nil {
+			return nil, nil, errors.New("credential storage is unavailable")
+		}
+		if ciphertext, nonce, err = s.Secrets.Seal(secret); err != nil {
+			return nil, nil, err
+		}
+	}
+	updated, err := s.Store.UpdateGitCredential(ctx, item, ciphertext, nonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	what := "metadata"
+	if secret != nil {
+		what = "secret"
+	}
+	audit(ctx, s.Store, "git_credential.update", "git_credential", updated.ID, "Agent rotated "+what+" for credential "+updated.Name)
+	return nil, s.verifiedCredential(ctx, updated.ID, in.Repository), nil
+}
+
+// verifyGitCredential re-checks one credential, or every credential when no id
+// is given.
+func (s *Server) verifyGitCredential(ctx context.Context, _ *mcp.CallToolRequest, in GitCredentialVerifyInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:read"); err != nil {
+		return nil, nil, err
+	}
+	if s.Importer == nil {
+		return nil, nil, errors.New("credential verification is unavailable")
+	}
+	if strings.TrimSpace(in.ID) == "" {
+		results, err := s.Importer.VerifyAllCredentials(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		items, err := s.Store.ListGitCredentials(ctx)
+		return nil, map[string]any{"items": items, "verifications": results}, err
+	}
+	item, err := s.Store.GetGitCredential(ctx, in.ID)
+	if err != nil {
+		return nil, nil, errors.New("git credential not found")
+	}
+	return nil, s.verifiedCredential(ctx, item.ID, in.Repository), nil
+}
+
+// setProjectCredential re-points a project at a different stored credential.
+// Without it, a rotated secret could never reach the projects that need it.
+func (s *Server) setProjectCredential(ctx context.Context, _ *mcp.CallToolRequest, in ProjectCredentialInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:configure"); err != nil {
+		return nil, nil, err
+	}
+	project, err := s.Store.GetProject(ctx, in.ProjectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	credentialID := ""
+	if strings.TrimSpace(in.CredentialID) != "" {
+		credential, err := s.Store.GetGitCredential(ctx, in.CredentialID)
+		if err != nil {
+			return nil, nil, errors.New("git credential not found")
+		}
+		credentialID = credential.ID
+	}
+	if err := s.Store.SetProjectSourceCredential(ctx, project.ID, credentialID); err != nil {
+		return nil, nil, err
+	}
+	audit(ctx, s.Store, "project.credential.update", "project", project.ID, "Agent changed the project's source credential")
+	updated, err := s.Store.GetProject(ctx, project.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The point of re-pointing is usually that the old credential stopped
+	// working, so say straight away whether the new one can read the repository.
+	var verification any
+	if credentialID != "" && s.Importer != nil {
+		if result, verifyErr := s.Importer.VerifyCredential(ctx, credentialID, updated.SourceURL); verifyErr == nil {
+			verification = result
+		}
+	}
+	return nil, map[string]any{"project": updated, "verification": verification}, nil
+}
+
+// verifiedCredential runs a verification and returns the credential alongside
+// its result, so a caller never sees a stored credential without knowing
+// whether it actually works.
+func (s *Server) verifiedCredential(ctx context.Context, id, repository string) map[string]any {
+	var verification any
+	if s.Importer != nil {
+		if result, err := s.Importer.VerifyCredential(ctx, id, repository); err == nil {
+			verification = result
+		} else {
+			verification = map[string]any{"status": "failed", "error": err.Error()}
+		}
+	}
+	item, _ := s.Store.GetGitCredential(ctx, id)
+	return map[string]any{"credential": item, "verification": verification}
 }
 
 func (s *Server) deleteGitCredential(ctx context.Context, _ *mcp.CallToolRequest, in IDInput) (*mcp.CallToolResult, any, error) {
@@ -499,14 +650,28 @@ func (s *Server) deploy(ctx context.Context, _ *mcp.CallToolRequest, in DeployIn
 	if err != nil {
 		return nil, nil, err
 	}
-	actor, _ := auth.IdentityFrom(ctx)
-	op := store.Operation{ID: uuid.NewString(), Kind: "deployment.create", TargetType: "project", TargetID: project.ID, Summary: "Deploy " + project.Name, RequestedBy: actor.UserID, Payload: jsonPayload(map[string]any{"trigger": "agent"})}
-	op, err = s.Store.CreateOperation(ctx, op, in.IdempotencyKey)
-	if err == nil {
-		s.Operations.Enqueue(op.ID)
-		audit(ctx, s.Store, "deployment.create", "project", project.ID, "Agent queued deployment")
+	// Report the commit this deployment will build, and warn when the tracked
+	// ref has moved past it. A deployment builds the tree captured at import or
+	// the last project_source_resync, so without this an agent that pushes and
+	// then deploys silently ships the previous commit and has no way to tell.
+	source := importer.SourceStatus{Commit: project.SourceCommit, Ref: project.SourceRef, Reason: "the importer is unavailable"}
+	if s.Importer != nil {
+		source = s.Importer.CheckSource(ctx, project)
 	}
-	return nil, op, err
+	actor, _ := auth.IdentityFrom(ctx)
+	op := store.Operation{ID: uuid.NewString(), Kind: "deployment.create", TargetType: "project", TargetID: project.ID, Summary: "Deploy " + project.Name, RequestedBy: actor.UserID, Payload: jsonPayload(map[string]any{"trigger": "agent", "sourceCommit": source.Commit})}
+	op, err = s.Store.CreateOperation(ctx, op, in.IdempotencyKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	level := "info"
+	if source.Behind {
+		level = "warn"
+	}
+	_ = s.Store.LogOperation(ctx, op.ID, level, source.Summary())
+	s.Operations.Enqueue(op.ID)
+	audit(ctx, s.Store, "deployment.create", "project", project.ID, "Agent queued deployment")
+	return nil, map[string]any{"operation": op, "source": source, "note": source.Summary()}, nil
 }
 func (s *Server) rollback(ctx context.Context, _ *mcp.CallToolRequest, in RollbackInput) (*mcp.CallToolResult, any, error) {
 	if err := require(ctx, "asgard:deploy"); err != nil {
@@ -537,30 +702,24 @@ func (s *Server) updateConfig(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	if err != nil {
 		return nil, nil, err
 	}
-	if in.Role != "web" && in.Role != "worker" && in.Role != "stateful" {
-		return nil, nil, errors.New("role must be web, worker, or stateful")
-	}
-	if in.Public {
-		if in.Port < 1 || in.Port > 65535 {
-			return nil, nil, errors.New("public service needs a valid port")
-		}
-		if err := composecfg.ValidatePublicHostname(in.Hostname, s.Config.Domain); err != nil {
-			return nil, nil, err
-		}
-	}
-	if err := composecfg.ValidateEnvironment(in.Environment); err != nil {
+	// Same rules the REST API applies. This tool used to check only the role
+	// and hostname, so an agent could set limits, a restart policy, or a health
+	// path that the browser rejected on the identical field.
+	settings := composecfg.ServiceSettings{Role: in.Role, Environment: in.Environment, Public: in.Public, Port: in.Port, Hostname: in.Hostname, HealthPath: in.HealthPath, HSTSMode: in.HSTSMode, CPULimit: in.CPULimit, MemoryLimit: in.MemoryLimit, PIDsLimit: in.PIDsLimit, RestartPolicy: in.RestartPolicy}
+	if err := settings.Normalize(s.Config.Domain); err != nil {
 		return nil, nil, err
 	}
-	svc.Role = in.Role
-	svc.Environment = in.Environment
-	svc.Public = in.Public
-	svc.Port = in.Port
-	svc.Hostname = strings.ToLower(in.Hostname)
-	svc.HealthPath = in.HealthPath
-	svc.CPULimit = in.CPULimit
-	svc.MemoryLimit = in.MemoryLimit
-	svc.PIDsLimit = in.PIDsLimit
-	svc.RestartPolicy = in.RestartPolicy
+	svc.Role = settings.Role
+	svc.Environment = settings.Environment
+	svc.Public = settings.Public
+	svc.Port = settings.Port
+	svc.Hostname = settings.Hostname
+	svc.HealthPath = settings.HealthPath
+	svc.HSTSMode = settings.HSTSMode
+	svc.CPULimit = settings.CPULimit
+	svc.MemoryLimit = settings.MemoryLimit
+	svc.PIDsLimit = settings.PIDsLimit
+	svc.RestartPolicy = settings.RestartPolicy
 	if err = s.Store.UpdateService(ctx, svc, in.ConfigRevision); err != nil {
 		return nil, nil, err
 	}
@@ -568,6 +727,33 @@ func (s *Server) updateConfig(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	updated, err := s.Store.GetService(ctx, svc.ID)
 	return nil, updated, err
 }
+
+// reclaimStorage frees Docker artifacts Asgard itself created.
+func (s *Server) reclaimStorage(ctx context.Context, _ *mcp.CallToolRequest, in ReclaimInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:operate"); err != nil {
+		return nil, nil, err
+	}
+	if s.Reclaimer == nil {
+		return nil, nil, errors.New("storage reclamation is unavailable")
+	}
+	policy := s.Reclaimer.Policy
+	policy.DryRun = in.DryRun
+	if in.KeepReleases > 0 {
+		policy.KeepReleases = in.KeepReleases
+	}
+	// Scoped so an agent's override cannot change the policy the scheduled
+	// sweep and the deployer run under.
+	scoped := &reclaim.Reclaimer{Store: s.Store, Docker: s.Docker, Policy: policy}
+	result, err := scoped.Run(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !in.DryRun {
+		audit(ctx, s.Store, "storage.reclaim", "system", "", result.Summary())
+	}
+	return nil, result, nil
+}
+
 func (s *Server) containerAction(ctx context.Context, _ *mcp.CallToolRequest, in ActionInput) (*mcp.CallToolResult, any, error) {
 	if err := require(ctx, "asgard:operate"); err != nil {
 		return nil, nil, err

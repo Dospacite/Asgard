@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -277,16 +278,35 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// Say which commit this deployment will build, and say so when the tracked
+	// ref has moved past it. A deployment builds the tree captured at import or
+	// the last re-sync, which is what makes releases reproducible — but until
+	// this was reported, "push, then deploy" silently shipped the old commit.
+	source := s.sourceStatus(r.Context(), project)
 	actor := identity(r)
-	op := store.Operation{ID: uuid.NewString(), Kind: "deployment.create", TargetType: "project", TargetID: project.ID, Summary: "Deploy " + project.Name, RequestedBy: actor.UserID, Payload: payload(map[string]any{"trigger": "manual"})}
+	op := store.Operation{ID: uuid.NewString(), Kind: "deployment.create", TargetType: "project", TargetID: project.ID, Summary: "Deploy " + project.Name, RequestedBy: actor.UserID, Payload: payload(map[string]any{"trigger": "manual", "sourceCommit": source.Commit})}
 	op, err = s.Store.CreateOperation(r.Context(), op, idempotency(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	level := "info"
+	if source.Behind {
+		level = "warn"
+	}
+	_ = s.Store.LogOperation(r.Context(), op.ID, level, source.Summary())
 	s.Operations.Enqueue(op.ID)
 	s.auditRequest(r, "deployment.create", "project", project.ID, "Queued deployment")
-	httpx.JSON(w, http.StatusAccepted, op)
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"operation": op, "id": op.ID, "kind": op.Kind, "status": op.Status, "source": source})
+}
+
+// sourceStatus resolves which commit a deployment would build. It never blocks
+// a deployment: an unreachable remote leaves the status unchecked.
+func (s *Server) sourceStatus(ctx context.Context, project store.Project) importer.SourceStatus {
+	if s.Importer == nil {
+		return importer.SourceStatus{Commit: project.SourceCommit, Ref: project.SourceRef, Reason: "the importer is unavailable"}
+	}
+	return s.Importer.CheckSource(ctx, project)
 }
 
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {

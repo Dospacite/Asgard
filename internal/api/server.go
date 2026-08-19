@@ -24,6 +24,7 @@ import (
 	"github.com/rousoftware/asgard/internal/oauth"
 	"github.com/rousoftware/asgard/internal/operations"
 	"github.com/rousoftware/asgard/internal/proxy"
+	"github.com/rousoftware/asgard/internal/reclaim"
 	"github.com/rousoftware/asgard/internal/secrets"
 	"github.com/rousoftware/asgard/internal/store"
 )
@@ -40,6 +41,7 @@ type Dependencies struct {
 	OAuth      *oauth.Server
 	MCP        http.Handler
 	Secrets    *secrets.Box
+	Reclaimer  *reclaim.Reclaimer
 }
 type Server struct {
 	Dependencies
@@ -88,6 +90,7 @@ func (s *Server) routes() http.Handler {
 		r.Get("/me", s.me)
 		r.Get("/overview", s.overview)
 		r.Get("/system", s.system)
+		r.Post("/system/reclaim", s.storageReclaim)
 		r.Get("/events", s.events)
 		r.Get("/compose-contract", s.composeContract)
 		r.Post("/compose-contract/validate", s.validateCompose)
@@ -98,6 +101,9 @@ func (s *Server) routes() http.Handler {
 		r.Post("/imports/zip", s.importArchive)
 		r.Get("/git-credentials", s.gitCredentials)
 		r.Post("/git-credentials", s.createGitCredential)
+		r.Post("/git-credentials/verify", s.verifyAllGitCredentials)
+		r.Patch("/git-credentials/{credentialID}", s.updateGitCredential)
+		r.Post("/git-credentials/{credentialID}/verify", s.verifyGitCredential)
 		r.Delete("/git-credentials/{credentialID}", s.deleteGitCredential)
 		r.Route("/projects/{projectID}", func(r chi.Router) {
 			r.Get("/", s.project)
@@ -105,6 +111,7 @@ func (s *Server) routes() http.Handler {
 			r.Get("/source-files", s.sourceFiles)
 			r.Patch("/source-files", s.updateSourceFile)
 			r.Post("/source-sync", s.resyncSource)
+			r.Put("/source-credential", s.setProjectCredential)
 			r.Get("/deployments", s.deployments)
 			r.Post("/deployments", s.createDeployment)
 			r.Post("/rollbacks", s.rollback)
