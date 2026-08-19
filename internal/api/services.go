@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -72,12 +73,12 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid_port", "A public service needs a valid internal port.")
 			return
 		}
-		if body.Hostname == "" || !(body.Hostname == s.Config.Domain || strings.HasSuffix(body.Hostname, "."+s.Config.Domain)) {
-			httpx.Error(w, http.StatusBadRequest, "invalid_hostname", "Hostname must be inside "+s.Config.Domain+".")
-			return
-		}
-		if body.Hostname == s.Config.Domain {
+		switch err := composecfg.ValidatePublicHostname(body.Hostname, s.Config.Domain); {
+		case errors.Is(err, composecfg.ErrHostnameReserved):
 			httpx.Error(w, http.StatusConflict, "reserved_hostname", "The control-plane hostname is reserved.")
+			return
+		case err != nil:
+			httpx.Error(w, http.StatusBadRequest, "invalid_hostname", "Hostname must be a fully qualified DNS name, such as app.example.com, whose DNS points at this host.")
 			return
 		}
 	}

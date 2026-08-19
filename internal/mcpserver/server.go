@@ -540,8 +540,13 @@ func (s *Server) updateConfig(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	if in.Role != "web" && in.Role != "worker" && in.Role != "stateful" {
 		return nil, nil, errors.New("role must be web, worker, or stateful")
 	}
-	if in.Public && (in.Port < 1 || in.Hostname == "" || !(in.Hostname == s.Config.Domain || strings.HasSuffix(in.Hostname, "."+s.Config.Domain)) || in.Hostname == s.Config.Domain) {
-		return nil, nil, errors.New("public service needs a valid port and non-control-plane hostname inside the Asgard domain")
+	if in.Public {
+		if in.Port < 1 || in.Port > 65535 {
+			return nil, nil, errors.New("public service needs a valid port")
+		}
+		if err := composecfg.ValidatePublicHostname(in.Hostname, s.Config.Domain); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := composecfg.ValidateEnvironment(in.Environment); err != nil {
 		return nil, nil, err

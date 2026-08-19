@@ -557,6 +557,32 @@ func ValidateHostname(value string) bool {
 	return len(value) <= 253 && hostnamePattern.MatchString(value)
 }
 
+// Reasons a hostname cannot back a public HTTPS route.
+var (
+	ErrHostnameInvalid  = errors.New("hostname must be a fully qualified DNS name such as app.example.com")
+	ErrHostnameReserved = errors.New("the control-plane hostname is reserved")
+)
+
+// ValidatePublicHostname checks a hostname destined for a public HTTPS route.
+//
+// Any fully qualified name is accepted, not just names under the control
+// plane's wildcard domain: a project may serve its own apex or subdomain as
+// long as that name's DNS points at this host, and Traefik will request a
+// certificate for it per-host over the HTTP-01 challenge. Two rules remain,
+// and neither is about which zone the name lives in — a single-label name can
+// never be issued a public certificate, and the control plane will not hand
+// out its own name.
+func ValidatePublicHostname(value, controlPlaneDomain string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if !ValidateHostname(value) || !strings.Contains(value, ".") {
+		return ErrHostnameInvalid
+	}
+	if controlPlaneDomain != "" && value == strings.ToLower(strings.TrimSpace(controlPlaneDomain)) {
+		return ErrHostnameReserved
+	}
+	return nil
+}
+
 func checkPublicHost(host string) error {
 	addresses, err := net.LookupIP(host)
 	if err != nil {

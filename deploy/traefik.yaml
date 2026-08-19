@@ -26,7 +26,14 @@ entryPoints:
         # the GitHub route is the constraint and a 7 MB artifact can legitimately
         # need 20 minutes. idleTimeout still bounds genuinely stalled clients.
         readTimeout: 1800s
-        idleTimeout: 180s
+        # idleTimeout must stay above the longest silence a browser SPA keeps on
+        # an open connection, or its first request after that silence is written
+        # to a connection we already tore down. The Directus admin app goes idle
+        # after exactly 300s and then fires a single, unretried session probe: if
+        # that probe fails the app decides the session expired and bounces the
+        # editor to the login screen, discarding unsaved changes. At Traefik's
+        # 180s default that probe was always the first write after a GOAWAY.
+        idleTimeout: 600s
 providers:
   file:
     directory: /data/traefik/dynamic

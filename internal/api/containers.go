@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/rousoftware/asgard/internal/dockerx"
 	"github.com/rousoftware/asgard/internal/httpx"
 	"github.com/rousoftware/asgard/internal/store"
@@ -83,8 +84,8 @@ func (s *Server) adoptContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Hostname = strings.ToLower(strings.TrimSpace(body.Hostname))
-	if body.Public && (body.Port < 1 || body.Port > 65535 || body.Hostname == s.Config.Domain || !strings.HasSuffix(body.Hostname, "."+s.Config.Domain)) {
-		httpx.Error(w, http.StatusBadRequest, "invalid_route", "Public adoption needs a valid port and hostname inside the wildcard domain.")
+	if body.Public && (body.Port < 1 || body.Port > 65535 || composecfg.ValidatePublicHostname(body.Hostname, s.Config.Domain) != nil) {
+		httpx.Error(w, http.StatusBadRequest, "invalid_route", "Public adoption needs a valid port and a fully qualified hostname that is not the control plane's own.")
 		return
 	}
 	if body.HealthPath == "" {
