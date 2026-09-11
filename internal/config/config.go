@@ -37,6 +37,15 @@ type Config struct {
 	KeepReleaseImages int
 	BuildCacheBytes   int64
 	ReclaimInterval   time.Duration
+	// Log shipping to a collector that accepts a Loki push API. An empty sink
+	// disables it: an install with no collector should not keep checkpoints for
+	// containers nobody reads. Lookback bounds the first read of a container
+	// that has no checkpoint yet, so enabling the collector does not replay
+	// everything a long-running service ever wrote.
+	LogSinkURL        string
+	LogShipInterval   time.Duration
+	LogShipLookback   time.Duration
+	LogShipBatchBytes int64
 	Timezone          *time.Location
 	ACMEEmail         string
 	DataVolume        string
@@ -84,6 +93,18 @@ func Load() (Config, error) {
 	if err != nil || reclaimHours < 0 || reclaimHours > 168 {
 		return Config{}, errors.New("ASGARD_RECLAIM_HOURS must be between 0 and 168")
 	}
+	logInterval, err := envInt("ASGARD_LOG_SHIP_INTERVAL_SECONDS", 15)
+	if err != nil || logInterval < 5 || logInterval > 3600 {
+		return Config{}, errors.New("ASGARD_LOG_SHIP_INTERVAL_SECONDS must be between 5 and 3600")
+	}
+	logLookback, err := envInt("ASGARD_LOG_SHIP_LOOKBACK_SECONDS", 300)
+	if err != nil || logLookback < 0 || logLookback > 86400 {
+		return Config{}, errors.New("ASGARD_LOG_SHIP_LOOKBACK_SECONDS must be between 0 and 86400")
+	}
+	logBatchKB, err := envInt("ASGARD_LOG_SHIP_BATCH_KB", 1024)
+	if err != nil || logBatchKB < 16 || logBatchKB > 8192 {
+		return Config{}, errors.New("ASGARD_LOG_SHIP_BATCH_KB must be between 16 and 8192")
+	}
 	return Config{
 		ListenAddr:               env("ASGARD_LISTEN_ADDR", ":8080"),
 		PublicURL:                publicURL,
@@ -105,6 +126,10 @@ func Load() (Config, error) {
 		KeepReleaseImages:        keepImages,
 		BuildCacheBytes:          int64(cacheGB) << 30,
 		ReclaimInterval:          time.Duration(reclaimHours) * time.Hour,
+		LogSinkURL:               strings.TrimSpace(os.Getenv("ASGARD_LOG_SINK_URL")),
+		LogShipInterval:          time.Duration(logInterval) * time.Second,
+		LogShipLookback:          time.Duration(logLookback) * time.Second,
+		LogShipBatchBytes:        int64(logBatchKB) << 10,
 		Timezone:                 tz,
 		ACMEEmail:                strings.TrimSpace(os.Getenv("ASGARD_ACME_EMAIL")),
 		DataVolume:               env("ASGARD_DATA_VOLUME", "asgard-data"),

@@ -39,6 +39,65 @@ services:
     depends_on:
       traefik-config-init:
         condition: service_completed_successfully
+  # The log store. It has no router and no published port: the only clients are
+  # the control plane pushing into it and Grafana reading from it, both over the
+  # management network.
+  loki:
+    image: grafana/loki:3.7.7
+    restart: unless-stopped
+    labels:
+      com.rousoftware.asgard.managed: "true"
+      com.rousoftware.asgard.system: log-collector
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    networks: [asgard-management]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 1.0
+    # No healthcheck: the image is scratch-based with no shell and no HTTP
+    # client, so there is nothing to run one with. Restart policy covers a
+    # crashed Loki, and the control plane's shipper retries whatever it could
+    # not deliver rather than treating an empty sink as success.
+  # The query UI, and the only part of the collector that faces the internet.
+  # Grafana authenticates; Loki does not have to, because it is unreachable from
+  # anywhere but this network.
+  grafana:
+    image: grafana/grafana:13.2.1
+    restart: unless-stopped
+    labels:
+      com.rousoftware.asgard.managed: "true"
+      com.rousoftware.asgard.system: log-collector
+    environment:
+      GF_SERVER_ROOT_URL: https://${ASGARD_GRAFANA_HOSTNAME:?set ASGARD_GRAFANA_HOSTNAME in deploy/.env}
+      GF_SECURITY_ADMIN_PASSWORD: ${ASGARD_GRAFANA_ADMIN_PASSWORD:?set ASGARD_GRAFANA_ADMIN_PASSWORD in deploy/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Grafana 13 preinstalls the advisor app from grafana.com on first start.
+      # Nothing here needs it, and a log collector should not reach out to
+      # install software nobody asked for.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks: [asgard-management]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/api/health | grep -q '\"database\": \"ok\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
   asgard:
     build:
       context: ..
@@ -59,6 +118,10 @@ services:
       ASGARD_TRAEFIK_DYNAMIC_DIR: /data/traefik/dynamic
       ASGARD_EDGE_NETWORK: asgard-edge
       ASGARD_MANAGEMENT_NETWORK: asgard-management
+      # Container logs are pushed to the collector beside us. A value set here
+      # or in deploy/.env turns shipping on; an empty ASGARD_LOG_SINK_URL in
+      # deploy/.env turns it off without editing this file.
+      ASGARD_LOG_SINK_URL: ${ASGARD_LOG_SINK_URL-http://loki:3100}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -77,3 +140,7 @@ volumes:
     name: asgard-data
   traefik-data:
     name: asgard-traefik-data
+  loki-data:
+    name: asgard-loki-data
+  grafana-data:
+    name: asgard-grafana-data

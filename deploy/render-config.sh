@@ -38,7 +38,11 @@ case "$control_hostname" in
 esac
 
 mkdir -p /data/traefik/dynamic
+# The collector UI is published under the wildcard zone unless an install moves
+# it somewhere whose DNS it controls.
+grafana_hostname="${ASGARD_GRAFANA_HOSTNAME:-grafana.$ASGARD_DOMAIN}"
 sed -e "s|__CONTROL_HOSTNAME__|$control_hostname|g" \
+    -e "s|__GRAFANA_HOSTNAME__|$grafana_hostname|g" \
     -e "s|__HSTS_SUBDOMAINS__|$hsts_subdomains|g" \
     -e "s|__HSTS_PRELOAD__|$hsts_preload|g" \
     /config/control-plane.yml.template > /data/traefik/dynamic/control-plane.yml
@@ -47,4 +51,5 @@ sed -e "s|__ACME_EMAIL__|$ASGARD_ACME_EMAIL|g" \
 chmod 0644 /data/traefik/dynamic/control-plane.yml /data/traefik/traefik.yml
 
 echo "control plane: $control_hostname (HSTS includeSubDomains=$hsts_subdomains, preload=$hsts_preload)"
+echo "log collector: https://$grafana_hostname (Loki stays internal, no route)"
 echo "workload zone: *.$ASGARD_DOMAIN"

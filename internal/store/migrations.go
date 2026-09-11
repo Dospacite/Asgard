@@ -342,6 +342,17 @@ CREATE TABLE IF NOT EXISTS webhooks (
     created_at TEXT NOT NULL
 );
 
+-- How far the log collector has read each container's output. Containers are
+-- recreated on every release, so rows are pruned against the containers that
+-- currently exist rather than kept.
+CREATE TABLE IF NOT EXISTS log_cursors (
+    container_id TEXT PRIMARY KEY,
+    last_ts TEXT NOT NULL,
+    last_stream TEXT NOT NULL DEFAULT '',
+    last_line TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 PRAGMA user_version = 3;
 `
 

@@ -1,0 +1,82 @@
+{
+  "uid": "asgard-container-logs",
+  "title": "Asgard container logs",
+  "tags": ["asgard", "logs"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "editable": true,
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "project",
+        "label": "Project",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": { "label": "project", "type": 1, "refId": "LokiVariableQueryEditor-VariableQuery" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": {
+          "label": "service",
+          "stream": "{project=~\"$project\"}",
+          "type": 1,
+          "refId": "LokiVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "logs",
+      "title": "Container output",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 22, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{project=~\"$project\", service=~\"$service\"}",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Lines per service",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (count_over_time({project=~\"$project\", service=~\"$service\"}[$__auto]))",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "stacking": { "mode": "normal" } } }, "overrides": [] }
+    }
+  ]
+}

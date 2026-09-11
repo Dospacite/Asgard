@@ -1,0 +1,61 @@
+# Loki configuration for the Asgard host.
+#
+# Loki never leaves the management network: it has no router in Traefik and no
+# published port, and auth stays off because the only client that can reach port
+# 3100 is the control plane that ships the logs. Grafana is the one component
+# exposed to a browser, and it is the one that authenticates.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Two weeks. The host has room for more, but a log collector that grows
+  # without bound eventually costs a deployment its disk, and two weeks is
+  # enough to investigate anything that is still worth investigating.
+  retention_period: 336h
+  reject_old_samples: true
+  reject_old_samples_max_age: 336h
+  # A single service with a hot loop must not be able to make a query's memory
+  # a problem for every other tenant on the host.
+  max_query_series: 5000
+  max_streams_per_user: 20000
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  delete_request_store: filesystem
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+
+analytics:
+  reporting_enabled: false

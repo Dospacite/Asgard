@@ -9,12 +9,26 @@ http:
       middlewares: [asgard-security]
       tls:
         certResolver: letsencrypt
+    # The log collector's UI. Loki itself has no router: it is reachable only
+    # from the management network, and Grafana is what authenticates.
+    grafana:
+      rule: Host(`__GRAFANA_HOSTNAME__`)
+      entryPoints: [websecure]
+      service: grafana
+      middlewares: [asgard-security]
+      tls:
+        certResolver: letsencrypt
   services:
     asgard-control:
       loadBalancer:
         passHostHeader: true
         servers:
           - url: http://asgard:8080
+    grafana:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://grafana:3000
   middlewares:
     asgard-security:
       headers:

@@ -39,6 +39,13 @@ request-serving container bursts against its CPU quota in well under a second,
 so it can average near-zero CPU while being stopped at the ceiling 40% of the
 time. Asgard reports both.
 
+**Logs that outlive a release.** The usual host-side shippers — Promtail, Alloy,
+Fluent Bit — all read `/var/lib/docker/containers`, which the safe Compose
+contract refuses to expose, so none of them can run on the workloads here.
+Asgard is already the process holding a Docker client for the whole host, so it
+tails every running managed container itself and pushes the frames to Loki;
+Grafana queries them. See [Log collection](#log-collection).
+
 **Networking.** Each project gets a private bridge by default. Managed shared
 networks give explicit cross-project connectivity with stable DNS aliases, live
 endpoint reconciliation, and topology views.
@@ -117,6 +124,12 @@ Edit `deploy/.env`:
 | `ASGARD_KEEP_RELEASE_IMAGES` | Releases whose images are kept — also how far back a rollback can reach (default `3`) |
 | `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `2`, `0` disables cache pruning) |
 | `ASGARD_RECLAIM_HOURS` | How often disk is reclaimed (default `12`, `0` disables) |
+| `ASGARD_GRAFANA_HOSTNAME` | Hostname of the log collector's UI, e.g. `grafana.apps.example.com` |
+| `ASGARD_GRAFANA_ADMIN_PASSWORD` | Grafana's admin password; also the only credential the collector exposes |
+| `ASGARD_LOG_SINK_URL` | Where container logs are pushed (default `http://loki:3100`); empty collects nothing |
+| `ASGARD_LOG_SHIP_INTERVAL_SECONDS` | How long output may sit uncollected (default `15`) |
+| `ASGARD_LOG_SHIP_LOOKBACK_SECONDS` | First read of a container with no checkpoint (default `300`) |
+| `ASGARD_LOG_SHIP_BATCH_KB` | Largest single push (default `1024`) |
 
 `ASGARD_DOMAIN` also decides HSTS defaults — see [HTTPS and
 HSTS](#https-and-hsts) below — so set it to the zone you actually own.
@@ -246,6 +259,70 @@ Routing*.
 
 ---
 
+## Log collection
+
+`docker compose -f deploy/compose.yaml up -d` also starts a collector: **Loki**
+holding the logs and **Grafana** querying them. Both are ordinary members of the
+Compose project, on the management network.
+
+**Why the shipping happens in the control plane.** Promtail, Grafana Alloy,
+Fluent Bit and every similar agent read container logs from
+`/var/lib/docker/containers` or from the Docker socket. Asgard's safe Compose
+contract refuses both — a project may only mount its own source and declared
+named volumes — so none of those agents can run against the workloads here, and
+Compose has no `logging` driver field to redirect a container's stdout. The
+control plane is the one process on the host that already holds a Docker client,
+so it does the tailing: every `ASGARD_LOG_SHIP_INTERVAL_SECONDS` it reads what
+each running managed container wrote since its last checkpoint, and pushes the
+frames to `ASGARD_LOG_SINK_URL`.
+
+**What arrives.** Each line is labelled `project`, `service` and `stream`
+(`stdout` or `stderr`), taken from the labels Asgard puts on the container. The
+container name, image and release are deliberately not labels: they change on
+every deployment, and a label that changes with each release is how a log store
+ends up with millions of streams.
+
+Only the containers of *projects* are collected. Helper containers — the
+migration and bootstrap scripts a deployment runs — are skipped, because their
+output is already in the operation log, and so are the services in
+`deploy/compose.yaml` itself: the control plane, Traefik, Loki and Grafana. Had
+the last group been included, Loki's own output would be stored inside Loki,
+Traefik's scanner traffic would swamp the store, and the control plane's stdout
+would be filed under a project that does not exist. Read those with
+`docker compose -f deploy/compose.yaml logs`.
+
+**What that costs.** A checkpoint per container is stored in the control plane's
+SQLite database, holding the timestamp and the last line shipped, and is pruned
+when the container it belongs to disappears. A burst larger than
+`ASGARD_LOG_SHIP_BATCH_KB` is sent in several pushes, and the checkpoint only
+moves once a push is accepted — so a Loki that is down, restarting, or refusing
+writes costs a delay, not data, as long as Docker still holds the container's
+log file.
+
+**Querying.** Open `https://$ASGARD_GRAFANA_HOSTNAME`, sign in as `admin` with
+`ASGARD_GRAFANA_ADMIN_PASSWORD`, and use *Explore* or the provisioned **Asgard
+container logs** dashboard. The dashboard filters by project and service; the
+underlying query is ordinary LogQL, e.g. `{service="web"} |= "error"`.
+
+**Exposure.** Grafana is the only part of the collector with a route, and it
+authenticates; `GF_USERS_ALLOW_SIGN_UP`, anonymous access, the update check and
+the usage report are all off in `deploy/compose.yaml`. Loki has no router and no
+published port, and its configuration disables auth because nothing outside the
+management network can reach port 3100 — the control plane pushes to it and
+Grafana reads from it. If you would rather not have the UI on the internet at
+all, drop the `grafana` router from `deploy/dynamic/control-plane.yml.template`
+and reach it over an SSH tunnel instead.
+
+**Retention.** Two weeks (`retention_period: 336h` in
+`deploy/loki/loki-config.yaml`), enforced by Loki's compactor. Changing it means
+changing that file and restarting Loki; the data lives in `asgard-loki-data`.
+
+**Turning it off.** Set `ASGARD_LOG_SINK_URL=` (empty) in `deploy/.env` and
+recreate the control plane. Shipping stops, the checkpoints stop being written,
+and the collector keeps serving whatever it already has.
+
+---
+
 ## Agent access
 
 The MCP endpoint is `<ASGARD_PUBLIC_URL>/mcp`. Clients discover OAuth metadata
@@ -329,11 +406,19 @@ sweep, and when a project is deleted. To act immediately, use *Settings →
 Disk reclamation* (which has a preview), `POST /api/v1/system/reclaim`, or the
 `storage_reclaim` MCP tool with `dryRun` first.
 
+The log collector is bounded the same way, by retention rather than by a sweep:
+Loki drops chunks older than `retention_period` (two weeks by default) from
+`asgard-loki-data`, so a chatty service costs disk for a fortnight rather than
+forever.
+
 ### Where state lives
 
 Everything is in the `asgard-data` Docker volume: the SQLite database, project
 source trees, encryption keys, generated Traefik configuration, and backups.
-Certificates are in `asgard-traefik-data`. Back up both.
+Certificates are in `asgard-traefik-data`. The collected logs are in
+`asgard-loki-data` and Grafana's users, dashboards and API keys are in
+`asgard-grafana-data`; both are rebuildable, in the sense that losing them costs
+history rather than anything Asgard needs to run. Back up the first two.
 
 The AES key in `keys/secrets.key` decrypts every stored Git credential. Losing
 it means re-entering those secrets; leaking it means rotating them.

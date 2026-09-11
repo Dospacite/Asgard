@@ -15,6 +15,7 @@ import (
 	"github.com/rousoftware/asgard/internal/deploy"
 	"github.com/rousoftware/asgard/internal/dockerx"
 	"github.com/rousoftware/asgard/internal/importer"
+	"github.com/rousoftware/asgard/internal/logship"
 	"github.com/rousoftware/asgard/internal/mcpserver"
 	"github.com/rousoftware/asgard/internal/networking"
 	"github.com/rousoftware/asgard/internal/oauth"
@@ -36,6 +37,7 @@ type App struct {
 	proxy      *proxy.Generator
 	collector  *dockerx.Collector
 	sweeper    *reclaim.Sweeper
+	shipper    *logship.Shipper
 	verifier   *importer.Verifier
 	http       *http.Server
 }
@@ -80,8 +82,9 @@ func New(cfg config.Config) (*App, error) {
 	mcpServer := mcpserver.New(mcpserver.Dependencies{Config: cfg, Store: database, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, Secrets: secretBox, Reclaimer: reclaimer})
 	server := api.New(api.Dependencies{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, Importer: projectImporter, Proxy: proxyGenerator, OAuth: oauthServer, MCP: mcpServer.Handler, Secrets: secretBox, Reclaimer: reclaimer})
 	collector := &dockerx.Collector{Engine: engine, Store: database, Interval: cfg.MetricsInterval}
+	shipper := &logship.Shipper{Docker: engine, Store: database, Sink: cfg.LogSinkURL, Interval: cfg.LogShipInterval, Lookback: cfg.LogShipLookback, BatchBytes: cfg.LogShipBatchBytes}
 	verifier := &importer.Verifier{Importer: projectImporter, Interval: cfg.CredentialVerifyInterval}
-	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, proxy: proxyGenerator, collector: collector, verifier: verifier, sweeper: sweeper}, nil
+	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, proxy: proxyGenerator, collector: collector, verifier: verifier, sweeper: sweeper, shipper: shipper}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -107,6 +110,8 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	// ASGARD_RECLAIM_HOURS=0 leaves disk management entirely to the operator.
 	a.sweeper.Start(ctx)
+	// ASGARD_LOG_SINK_URL="" leaves log collection to the operator.
+	a.shipper.Start(ctx)
 	a.http = &http.Server{Addr: a.Config.ListenAddr, Handler: a.API.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
 	errCh := make(chan error, 1)
 	go func() {
@@ -121,6 +126,7 @@ func (a *App) Run(ctx context.Context) error {
 		a.collector.Stop()
 		a.verifier.Stop()
 		a.sweeper.Stop()
+		a.shipper.Stop()
 		a.Operations.Wait()
 		return nil
 	case err := <-errCh:
@@ -135,6 +141,7 @@ func (a *App) Close() error {
 	a.collector.Stop()
 	a.verifier.Stop()
 	a.sweeper.Stop()
+	a.shipper.Stop()
 	_ = a.Docker.Close()
 	return a.Store.Close()
 }
