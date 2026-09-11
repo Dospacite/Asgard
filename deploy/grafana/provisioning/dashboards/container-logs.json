@@ -19,7 +19,8 @@
         "refresh": 2,
         "includeAll": true,
         "multi": true,
-        "current": { "text": "All", "value": "$__all" }
+        "current": { "text": "All", "value": "$__all" },
+        "allValue": ".+"
       },
       {
         "name": "service",
@@ -28,14 +29,15 @@
         "datasource": { "type": "loki", "uid": "loki" },
         "query": {
           "label": "service",
-          "stream": "{project=~\"$project\"}",
+          "stream": "{project=~\"${project:regex}\"}",
           "type": 1,
           "refId": "LokiVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
         "includeAll": true,
         "multi": true,
-        "current": { "text": "All", "value": "$__all" }
+        "current": { "text": "All", "value": "$__all" },
+        "allValue": ".+"
       }
     ]
   },
