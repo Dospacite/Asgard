@@ -124,10 +124,18 @@ func (s *Shipper) ship(ctx context.Context) {
 	keep := make([]string, 0, len(containers))
 	lines := 0
 	for _, container := range containers {
+		if !collectable(container) {
+			// Nothing here is ever shipped, so a checkpoint for it is stale and
+			// its container is about to be forgotten below.
+			continue
+		}
+		// A container that is not running right now keeps its checkpoint: a
+		// restart is not a new container, and dropping the checkpoint would
+		// re-read its lookback window and write the same lines twice.
+		keep = append(keep, container.ID)
 		if !shippable(container) {
 			continue
 		}
-		keep = append(keep, container.ID)
 		frames, err := s.pendingFrames(ctx, container)
 		if err != nil {
 			s.Logger.Warn("container logs could not be read", "container", container.Name, "error", err)
@@ -147,25 +155,30 @@ func (s *Shipper) ship(ctx context.Context) {
 	}
 }
 
-// shippable keeps the pass to the containers whose output is this system's to
-// collect: the ones Asgard deployed as projects.
+// collectable reports whether a container is one whose output this system
+// collects at all: a container of a project, rather than one of the scripts a
+// deployment runs to migrate or seed.
 //
 // The services in deploy/compose.yaml — the control plane, Traefik, Loki,
 // Grafana — carry the managed label too, so the managed flag alone is not
-// enough. Shipping them would put Loki's own output inside Loki, fill the store
-// with Traefik's access log, and file the control plane's stdout under a project
-// that does not exist. The project label is what distinguishes a tenant of this
-// host from the machinery running it.
-func shippable(container dockerx.Container) bool {
-	if !container.Managed || container.State != "running" {
+// enough. Collecting them would put Loki's own output inside Loki, fill the
+// store with Traefik's access log, and file the control plane's stdout under a
+// project that does not exist. The project label is what distinguishes a tenant
+// of this host from the machinery running it.
+func collectable(container dockerx.Container) bool {
+	if !container.Managed {
 		return false
 	}
 	if container.Labels["com.rousoftware.asgard.project"] == "" {
 		return false
 	}
-	// Helper containers are the short-lived scripts a deployment runs; their
-	// output already lands in the operation log.
 	return container.Labels["com.rousoftware.asgard.helper"] != "true"
+}
+
+// shippable narrows collectable to the containers that have output to read
+// right now.
+func shippable(container dockerx.Container) bool {
+	return collectable(container) && container.State == "running"
 }
 
 func (s *Shipper) pendingFrames(ctx context.Context, container dockerx.Container) ([]dockerx.LogFrame, error) {

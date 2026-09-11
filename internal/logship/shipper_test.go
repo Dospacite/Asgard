@@ -279,7 +279,7 @@ func TestShipDropsTheLineTheCheckpointAlreadyCovers(t *testing.T) {
 	}
 }
 
-func TestShipIgnoresStoppedHelperSystemAndUnmanagedContainers(t *testing.T) {
+func TestShipIgnoresSystemHelperAndUnmanagedContainers(t *testing.T) {
 	sink := newSink(t)
 	database := testStore(t)
 	helper := container("c3", "asgard-demo-app-helper-r1", map[string]string{"com.rousoftware.asgard.helper": "true"})
@@ -287,7 +287,7 @@ func TestShipIgnoresStoppedHelperSystemAndUnmanagedContainers(t *testing.T) {
 	stopped.State = "exited"
 	unmanaged := dockerx.Container{ID: "c4", Name: "someone-elses", State: "running", Managed: false, Labels: map[string]string{}}
 	// The compose services that run the collector itself are managed but belong
-	// to no project; shipping them would file Loki's log inside Loki.
+	// to no project; collecting them would file Loki's log inside Loki.
 	system := dockerx.Container{
 		ID: "c5", Name: "asgard-loki-1", State: "running", Managed: true,
 		Labels: map[string]string{
@@ -309,12 +309,41 @@ func TestShipIgnoresStoppedHelperSystemAndUnmanagedContainers(t *testing.T) {
 	shipper.ship(context.Background())
 
 	if len(source.queried) != 1 || source.queried[0] != "c1" {
-		t.Fatalf("queried %v, want only the running managed container of a project", source.queried)
+		t.Fatalf("queried %v, want only the running container of a project", source.queried)
 	}
-	for _, id := range []string{"c2", "c3", "c4", "c5"} {
+	// A stopped container of a project keeps its checkpoint: its id survives a
+	// restart, so forgetting it would make the next pass re-read and re-send
+	// everything in the lookback window.
+	if _, found, err := database.LogCursor(context.Background(), "c2"); err != nil || !found {
+		t.Errorf("checkpoint for the stopped project container was dropped, err=%v", err)
+	}
+	for _, id := range []string{"c3", "c4", "c5"} {
 		if _, found, err := database.LogCursor(context.Background(), id); err != nil || found {
 			t.Errorf("checkpoint for %s survived, want it pruned", id)
 		}
+	}
+}
+
+// A container that no longer exists must not leave a checkpoint behind: every
+// release creates new container ids, so without pruning the table grows by one
+// row per service per deployment forever.
+func TestShipForgetsCheckpointsOfRemovedContainers(t *testing.T) {
+	sink := newSink(t)
+	database := testStore(t)
+	source := &fakeSource{
+		containers: []dockerx.Container{container("c1", "asgard-demo-app-r1", nil)},
+		frames:     map[string][]dockerx.LogFrame{},
+	}
+	gone := "container-from-an-earlier-release"
+	if err := database.SetLogCursor(context.Background(), store.LogCursor{ContainerID: gone, Time: at(0), Stream: "stdout", Line: "old"}); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+	shipper := newShipper(t, source, database, sink.URL)
+
+	shipper.ship(context.Background())
+
+	if _, found, err := database.LogCursor(context.Background(), gone); err != nil || found {
+		t.Fatalf("checkpoint survived for a container that is gone, err=%v", err)
 	}
 }
 
