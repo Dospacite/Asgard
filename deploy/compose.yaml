@@ -123,7 +123,10 @@ services:
       # deploy/.env turns it off without editing this file.
       ASGARD_LOG_SINK_URL: ${ASGARD_LOG_SINK_URL-http://loki:3100}
     ports:
-      - "127.0.0.1:8080:8080"
+      # Host loopback only: Traefik fronts the control plane. Set
+      # ASGARD_CONTROL_PORT in deploy/.env when 8080 is already taken on the
+      # host, so the deployment's own port choice stays out of this file.
+      - "127.0.0.1:${ASGARD_CONTROL_PORT:-8080}:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - asgard-data:/data
