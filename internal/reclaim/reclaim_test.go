@@ -1,6 +1,8 @@
 package reclaim
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/rousoftware/asgard/internal/dockerx"
@@ -140,4 +142,21 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// A pass that removes anything must not run during an image build — including
+// one started through a policy-scoped copy, which is how the API and the MCP
+// tool run it. Nothing past the gate is reached, so no Docker is needed.
+func TestRunSkipsWhileABuildIsHeld(t *testing.T) {
+	base := &Reclaimer{Policy: Policy{KeepReleases: 3}}
+	release := base.HoldBuilds()
+	for name, r := range map[string]*Reclaimer{"base": base, "scoped": base.WithPolicy(Policy{KeepReleases: 1})} {
+		if _, err := r.Run(context.Background()); !errors.Is(err, ErrBuildInProgress) {
+			t.Fatalf("%s: Run during a build = %v, want ErrBuildInProgress", name, err)
+		}
+	}
+	// Builds hold the gate together, so a second one is never blocked.
+	second := base.HoldBuilds()
+	second()
+	release()
 }

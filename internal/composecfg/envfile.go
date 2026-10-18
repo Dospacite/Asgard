@@ -57,16 +57,25 @@ func parseEnvFiles(value any) ([]EnvFileRef, error) {
 	}
 }
 
-// loadEnvFiles reads the referenced files from the project root and returns
-// their merged variables. Later files override earlier ones, matching Compose.
-func loadEnvFiles(refs []EnvFileRef, root string) (map[string]string, error) {
+// loadEnvFiles reads the referenced files and returns their merged variables.
+// Later files override earlier ones, matching Compose.
+//
+// Compose resolves an env_file relative to the directory holding the Compose
+// file, so `deploy/compose.yaml` with `env_file: [.env]` reads deploy/.env.
+// Keeping that rule here is what lets a project whose Compose file sits in a
+// subdirectory import unchanged.
+func loadEnvFiles(refs []EnvFileRef, source Source) (map[string]string, error) {
 	merged := map[string]string{}
 	for _, ref := range refs {
 		clean := filepath.Clean(filepath.FromSlash(ref.Path))
 		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("env_file %q must stay inside the project directory", ref.Path)
 		}
-		data, err := os.ReadFile(filepath.Join(root, clean))
+		target := filepath.Join(source.AbsoluteDir(), clean)
+		if err := requireInsideRoot(source.Root, filepath.ToSlash(filepath.Join(source.Directory(), clean))); err != nil {
+			return nil, fmt.Errorf("env_file %q must stay inside the project directory", ref.Path)
+		}
+		data, err := os.ReadFile(target)
 		if err != nil {
 			if os.IsNotExist(err) && !ref.Required {
 				continue

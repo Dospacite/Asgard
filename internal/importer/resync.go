@@ -167,10 +167,10 @@ func carryDotEnv(project store.Project, staging string) (bool, error) {
 			return carried, err
 		}
 		target := filepath.Join(staging, relative)
-		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(target), composecfg.SourceDirMode); err != nil {
 			return carried, err
 		}
-		if err := os.WriteFile(target, data, 0o640); err != nil {
+		if err := os.WriteFile(target, data, composecfg.SourceFileMode); err != nil {
 			return carried, err
 		}
 		carried = true

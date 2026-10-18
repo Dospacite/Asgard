@@ -74,7 +74,7 @@ func Load(project store.Project) (Workspace, error) {
 			return Workspace{}, err
 		}
 		if spec.Kind == "compose" {
-			_, validation := composecfg.Parse([]byte(item.Content), project.ID, project.Slug, project.SourcePath)
+			_, validation := composecfg.Parse([]byte(item.Content), project.ID, project.Slug, composecfg.Source{Root: project.SourcePath, Path: spec.Path})
 			item.Validation = &validation
 		}
 		if spec.Kind == "dotenv" && item.Exists {
@@ -116,12 +116,12 @@ func Save(ctx context.Context, database *store.Store, project store.Project, dom
 
 	var incoming, previous composecfg.ValidationResult
 	if spec.Kind == "compose" {
-		_, incoming = composecfg.Parse([]byte(content), project.ID, project.Slug, project.SourcePath)
+		_, incoming = composecfg.Parse([]byte(content), project.ID, project.Slug, composecfg.Source{Root: project.SourcePath, Path: spec.Path})
 		adaptDomain(&incoming, domain)
 		if !incoming.Valid {
 			return Workspace{}, &Problem{Code: "compose_invalid", Message: "Compose validation failed. Fix the listed issues before saving.", Validation: &incoming}
 		}
-		_, previous = composecfg.Parse([]byte(current.Content), project.ID, project.Slug, project.SourcePath)
+		_, previous = composecfg.Parse([]byte(current.Content), project.ID, project.Slug, composecfg.Source{Root: project.SourcePath, Path: spec.Path})
 		adaptDomain(&previous, domain)
 		if err := rejectServiceRemoval(project.Services, incoming.Services, &incoming); err != nil {
 			return Workspace{}, err
@@ -163,12 +163,12 @@ func Save(ctx context.Context, database *store.Store, project store.Project, dom
 // incomingRoot is where the new tree is staged; env files and project-relative
 // mounts have to resolve against it rather than the tree being replaced.
 func ReplaceTree(ctx context.Context, database *store.Store, project store.Project, domain, previousCompose, incomingCompose, incomingRoot string, swap func() error) (composecfg.ValidationResult, error) {
-	_, incoming := composecfg.Parse([]byte(incomingCompose), project.ID, project.Slug, incomingRoot)
+	_, incoming := composecfg.Parse([]byte(incomingCompose), project.ID, project.Slug, composecfg.Source{Root: incomingRoot, Path: project.ComposePath})
 	adaptDomain(&incoming, domain)
 	if !incoming.Valid {
 		return incoming, &Problem{Code: "compose_invalid", Message: "The re-synced Compose file is not valid for this platform. The running project was left untouched.", Validation: &incoming}
 	}
-	_, previous := composecfg.Parse([]byte(previousCompose), project.ID, project.Slug, project.SourcePath)
+	_, previous := composecfg.Parse([]byte(previousCompose), project.ID, project.Slug, composecfg.Source{Root: project.SourcePath, Path: project.ComposePath})
 	adaptDomain(&previous, domain)
 	if err := rejectServiceRemoval(project.Services, incoming.Services, &incoming); err != nil {
 		return incoming, err
@@ -524,13 +524,20 @@ func saveCompose(ctx context.Context, database *store.Store, project store.Proje
 	return rollback.commit()
 }
 
+// mergeService reconciles a service the operator has been running with the one
+// the file now describes.
+//
+// Two kinds of field meet here. The runtime settings an operator can change
+// through Asgard — role, environment, route, limits, restart policy — keep the
+// operator's value unless it still matches what the previous version of the
+// file produced, in which case the file's new value wins. Everything else,
+// including the container configuration Compose owns (entrypoint, user,
+// working directory, healthcheck, kernel settings), comes straight from the
+// file: the platform offers no way to edit it, so the file is the only author.
 func mergeService(current, previous, incoming store.Service, previousValid bool) store.Service {
 	merged := incoming
 	merged.ID = current.ID
 	merged.ProjectID = current.ProjectID
-	merged.CPULimit = current.CPULimit
-	merged.MemoryLimit = current.MemoryLimit
-	merged.PIDsLimit = current.PIDsLimit
 	merged.ConfigRevision = current.ConfigRevision
 	if !previousValid || previous.Name == "" {
 		merged.Role = current.Role
@@ -540,6 +547,9 @@ func mergeService(current, previous, incoming store.Service, previousValid bool)
 		merged.Hostname = current.Hostname
 		merged.HealthPath = current.HealthPath
 		merged.RestartPolicy = current.RestartPolicy
+		merged.CPULimit = current.CPULimit
+		merged.MemoryLimit = current.MemoryLimit
+		merged.PIDsLimit = current.PIDsLimit
 		return merged
 	}
 	merged.Role = chooseString(current.Role, previous.Role, incoming.Role)
@@ -548,6 +558,9 @@ func mergeService(current, previous, incoming store.Service, previousValid bool)
 	merged.Hostname = chooseString(current.Hostname, previous.Hostname, incoming.Hostname)
 	merged.HealthPath = chooseString(current.HealthPath, previous.HealthPath, incoming.HealthPath)
 	merged.RestartPolicy = chooseString(current.RestartPolicy, previous.RestartPolicy, incoming.RestartPolicy)
+	merged.CPULimit = chooseFloat(current.CPULimit, previous.CPULimit, incoming.CPULimit)
+	merged.MemoryLimit = chooseInt64(current.MemoryLimit, previous.MemoryLimit, incoming.MemoryLimit)
+	merged.PIDsLimit = chooseInt64(current.PIDsLimit, previous.PIDsLimit, incoming.PIDsLimit)
 	merged.Environment = mergeEnvironment(current.Environment, previous.Environment, incoming.Environment)
 	return merged
 }
@@ -567,6 +580,20 @@ func chooseInt(current, previous, incoming int) int {
 }
 
 func chooseBool(current, previous, incoming bool) bool {
+	if current == previous {
+		return incoming
+	}
+	return current
+}
+
+func chooseFloat(current, previous, incoming float64) float64 {
+	if current == previous {
+		return incoming
+	}
+	return current
+}
+
+func chooseInt64(current, previous, incoming int64) int64 {
 	if current == previous {
 		return incoming
 	}
@@ -595,10 +622,11 @@ func cloneMap(input map[string]string) map[string]string {
 func insertService(ctx context.Context, tx *sql.Tx, service store.Service) error {
 	command, _ := json.Marshal(service.Command)
 	environment, _ := json.Marshal(service.Environment)
+	config, _ := json.Marshal(service.Container)
 	dependsOn, _ := json.Marshal(service.DependsOn)
 	volumes, _ := json.Marshal(service.Volumes)
 	now := store.Now()
-	_, err := tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, service.ID, service.ProjectID, service.Name, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, now)
+	_, err := tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,config_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, service.ID, service.ProjectID, service.Name, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, now)
 	if err != nil {
 		return err
 	}
@@ -608,10 +636,11 @@ func insertService(ctx context.Context, tx *sql.Tx, service store.Service) error
 func updateComposedService(ctx context.Context, tx *sql.Tx, service store.Service, expectedRevision int) error {
 	command, _ := json.Marshal(service.Command)
 	environment, _ := json.Marshal(service.Environment)
+	config, _ := json.Marshal(service.Container)
 	dependsOn, _ := json.Marshal(service.DependsOn)
 	volumes, _ := json.Marshal(service.Volumes)
 	now := store.Now()
-	result, err := tx.ExecContext(ctx, `UPDATE services SET role=?,image=?,build_context=?,dockerfile=?,command_json=?,env_json=?,public=?,port=?,hostname=?,health_path=?,restart_policy=?,depends_on_json=?,volumes_json=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), service.Public, service.Port, service.Hostname, service.HealthPath, service.RestartPolicy, string(dependsOn), string(volumes), now, service.ID, expectedRevision)
+	result, err := tx.ExecContext(ctx, `UPDATE services SET role=?,image=?,build_context=?,dockerfile=?,command_json=?,env_json=?,config_json=?,public=?,port=?,hostname=?,health_path=?,cpu_limit=?,memory_limit=?,pids_limit=?,restart_policy=?,depends_on_json=?,volumes_json=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, service.ID, expectedRevision)
 	if err != nil {
 		return err
 	}
@@ -675,7 +704,7 @@ func replaceFile(root string, spec fileSpec, current File, content string) (file
 			_ = os.Remove(tempPath)
 		}
 	}()
-	mode := os.FileMode(0o640)
+	mode := composecfg.SourceFileMode
 	if current.Exists {
 		if info, statErr := os.Stat(target); statErr == nil {
 			mode = info.Mode().Perm()

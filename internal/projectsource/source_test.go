@@ -164,7 +164,7 @@ func createProject(t *testing.T, compose string) (store.Project, *store.Store) {
 	}
 	t.Cleanup(func() { database.Close() })
 	project := store.Project{ID: "project-1", Slug: "example", Name: "Example", SourceType: "git", SourcePath: root, ComposePath: "compose.yaml", PrimaryService: "app"}
-	_, validation := composecfg.Parse([]byte(compose), project.ID, project.Slug, root)
+	_, validation := composecfg.Parse([]byte(compose), project.ID, project.Slug, composecfg.Source{Root: root, Path: "compose.yaml"})
 	if !validation.Valid {
 		t.Fatalf("fixture invalid: %#v", validation.Errors)
 	}

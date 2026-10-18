@@ -49,6 +49,10 @@ function SourceEditor({project,workspace}:{project:Project;workspace:ProjectSour
   if(!active)return <section className="panel source-empty"><h2>No editable source files</h2><p>Import a Compose project to create its source workspace.</p></section>
   const localIssues=active.kind==='dotenv'?workspace.dotenvErrors:active.validation?.errors??[]
   const serverValidation=validationFromError(mutation.error)
+  // Warnings are not errors: the file is accepted, but the platform is not
+  // honoring the keys they name. They are shown where the file is edited,
+  // because that is where somebody can act on them.
+  const caveats=serverValidation?serverValidation.warnings:active.validation?.warnings??[]
   const issues=serverValidation?.errors??localIssues
   return <section className="source-workspace" aria-label="Project source editor">
     <nav className="source-file-list" aria-label="Editable source files">
@@ -69,6 +73,7 @@ function SourceEditor({project,workspace}:{project:Project;workspace:ProjectSour
         <textarea id="source-content" className="source-code" spellCheck={false} value={content} onChange={event=>{mutation.reset();setSavedPath('');setDrafts(current=>({...current,[active.path]:event.target.value}))}} aria-label={`${active.label} content`} aria-describedby="source-editor-help"/>
         <p id="source-editor-help" className="source-editor-help">{active.kind==='compose'?'Compose is validated against Asgard’s safe contract. Existing runtime overrides are preserved.':active.kind==='dotenv'?'.env values become candidates below; only variables selected for a service are deployed.':'Dockerfile changes are used the next time this project builds.'}</p>
         {issues.length>0?<IssueList title={serverValidation?'Couldn’t save this file':'Current validation issues'} issues={issues}/>:null}
+        {caveats.length>0?<IssueList tone="warn" title="Accepted, with these caveats" issues={caveats}/>:null}
         {mutation.error&&!serverValidation?<p className="form-error" role="alert">{mutation.error.message}</p>:null}
         {savedPath===active.path&&mutation.isSuccess?<div className="inline-success" role="status"><CheckCircle2 aria-hidden/>Saved {active.label}. Deploy when you are ready to apply it.</div>:null}
       </div>
@@ -151,7 +156,7 @@ function sourceHelp(kind:ProjectSourceFile['kind']){
   return 'Container build instructions'
 }
 
-function IssueList({title,issues}:{title:string;issues:ValidationIssue[]}){return <div className="source-issues" role="alert"><AlertCircle aria-hidden/><div><strong>{title}</strong><ul>{issues.map((issue,index)=><li key={`${issue.path}-${index}`}><code>{issue.path}</code> {issue.message}</li>)}</ul></div></div>}
+function IssueList({title,issues,tone}:{title:string;issues:ValidationIssue[];tone?:'warn'}){return <div className={`source-issues${tone==='warn'?' source-issues--warn':''}`} role={tone==='warn'?'status':'alert'}><AlertCircle aria-hidden/><div><strong>{title}</strong><ul>{issues.map((issue,index)=><li key={`${issue.path}-${index}`}><code>{issue.path}</code> {issue.message}</li>)}</ul></div></div>}
 
 function validationFromError(error:Error|null):SourceValidation|undefined{
   if(!(error instanceof APIError)||!error.details||typeof error.details!=='object')return undefined

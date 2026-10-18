@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS services (
     dockerfile TEXT NOT NULL DEFAULT 'Dockerfile',
     command_json TEXT NOT NULL DEFAULT '[]',
     env_json TEXT NOT NULL DEFAULT '{}',
+    config_json TEXT NOT NULL DEFAULT '{}',
     public INTEGER NOT NULL DEFAULT 0,
     port INTEGER NOT NULL DEFAULT 0,
     hostname TEXT NOT NULL DEFAULT '',
@@ -142,6 +143,7 @@ CREATE TABLE IF NOT EXISTS release_services (
     image_ref TEXT NOT NULL DEFAULT '',
     command_json TEXT NOT NULL DEFAULT '[]',
     env_json TEXT NOT NULL DEFAULT '{}',
+    config_json TEXT NOT NULL DEFAULT '{}',
     public INTEGER NOT NULL DEFAULT 0,
     port INTEGER NOT NULL DEFAULT 0,
     hostname TEXT NOT NULL DEFAULT '',
@@ -385,6 +387,13 @@ var addedColumns = []struct{ table, column, definition string }{
 	// Records the commit a Git import or re-sync captured, so operators can see
 	// which revision the working tree that deployments build actually holds.
 	{"projects", "source_commit", "TEXT NOT NULL DEFAULT ''"},
+	// The container-level configuration a Compose file declares — entrypoint,
+	// user, working directory, labels, healthcheck, and the kernel and storage
+	// settings a service may ask for. One JSON column rather than a dozen, and
+	// snapshotted into release_services so a rollback restores exactly what the
+	// release ran.
+	{"services", "config_json", "TEXT NOT NULL DEFAULT '{}'"},
+	{"release_services", "config_json", "TEXT NOT NULL DEFAULT '{}'"},
 }
 
 // addedIndexes run after addedColumns, because an index over a column that a

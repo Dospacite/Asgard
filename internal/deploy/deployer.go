@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/rousoftware/asgard/internal/composecfg"
@@ -133,7 +132,18 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	}
 	for _, svc := range services {
 		for _, spec := range svc.Volumes {
-			if _, isProjectMount := composecfg.ProjectMount(spec); isProjectMount {
+			relative, isProjectMount := composecfg.ProjectMount(spec)
+			if isProjectMount {
+				// A path the project does not ship but mounts as a data
+				// directory — `./data:/data`, the way an ordinary Compose file
+				// persists state — is created here, in the project's own source
+				// tree, which is what Compose would have done on the host. The
+				// mount is then served from Asgard's data volume as a subpath.
+				// A file the project does ship is left alone: creation is only
+				// for the paths that are missing.
+				if err = createMountDirectory(filepath.Join(project.SourcePath, filepath.FromSlash(relative))); err != nil {
+					return fmt.Errorf("prepare mount %s for %s: %w", relative, svc.Name, err)
+				}
 				continue
 			}
 			parts := strings.Split(spec, ":")
@@ -150,9 +160,16 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	}
 	stoppedOld := []string{}
 	candidates := map[string]dockerx.Container{}
+	// kept marks the candidates that are the previous release's own running
+	// containers, carried over unchanged. A failed release must leave them
+	// running, not remove them with the containers it created.
+	kept := map[string]bool{}
 	defer func() {
 		if !succeeded {
-			for _, item := range candidates {
+			for serviceID, item := range candidates {
+				if kept[serviceID] {
+					continue
+				}
 				if output, logsErr := d.Docker.Logs(context.WithoutCancel(ctx), item.ID, 200, ""); logsErr == nil {
 					for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 						if line != "" {
@@ -180,7 +197,10 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 		if payload.RollbackReleaseID == "" && svc.BuildContext != "" {
 			imageRef = fmt.Sprintf("asgard/%s/%s:r%d", project.Slug, svc.Name, release.Version)
 			contextDir := filepath.Join(project.SourcePath, svc.BuildContext)
-			if err = d.Docker.Build(ctx, contextDir, svc.Dockerfile, imageRef, log); err != nil {
+			release := d.holdBuilds()
+			err = d.Docker.Build(ctx, contextDir, svc.Dockerfile, imageRef, svc.Container.BuildTarget, svc.Container.BuildArgs, log)
+			release()
+			if err != nil {
 				return fmt.Errorf("build %s: %w", svc.Name, err)
 			}
 		} else {
@@ -189,12 +209,29 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 				return fmt.Errorf("image %s: %w", svc.Name, normErr)
 			}
 			imageRef = normalized
-			if err = d.Docker.Pull(ctx, imageRef, log); err != nil {
+			// A rollback restores the image the release ran, which the host
+			// keeps for the retention window. Pulling it would be wrong twice
+			// over: a tag Asgard built itself exists on no registry, and rolling
+			// back is not a request for whatever the tag points at today.
+			if payload.RollbackReleaseID != "" && d.Docker.ImageExists(ctx, imageRef) {
+				log("Using the image this release ran: " + imageRef)
+			} else if err = d.Docker.Pull(ctx, imageRef, log); err != nil {
+				if payload.RollbackReleaseID != "" {
+					return fmt.Errorf("pull %s: %w. The image this release ran is no longer on the host — releases whose images have been reclaimed cannot be restored; deploy the project again to build a new one", svc.Name, err)
+				}
 				return fmt.Errorf("pull %s: %w", svc.Name, err)
 			}
 		}
 		if err = d.Store.SetReleaseServiceImage(ctx, release.ID, svc.ID, imageRef); err != nil {
 			return err
+		}
+		request := dockerx.CreateRequest{Project: project, Service: svc, ReleaseID: release.ID, Version: release.Version, Image: imageRef, ProjectNetwork: projectNetwork, EdgeNetwork: d.EdgeNetwork, DataVolume: d.DataVolume, SourceSubpath: sourceSubpath}
+		request.SpecHash = d.specHash(ctx, request)
+		if current, ok := d.unchanged(ctx, svc, request.SpecHash, old[svc.ID]); ok {
+			log(fmt.Sprintf("%s is unchanged; keeping its running container %s", svc.Name, current.Name))
+			candidates[svc.ID] = current
+			kept[svc.ID] = true
+			continue
 		}
 		if stopPriorBeforeCandidate(svc) && old[svc.ID].DockerID != "" {
 			if err = d.Docker.Action(ctx, old[svc.ID].DockerID, "stop"); err != nil {
@@ -202,24 +239,25 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 			}
 			stoppedOld = append(stoppedOld, old[svc.ID].DockerID)
 		}
-		candidate, err := d.Docker.CreateServiceContainer(ctx, dockerx.CreateRequest{Project: project, Service: svc, ReleaseID: release.ID, Version: release.Version, Image: imageRef, ProjectNetwork: projectNetwork, EdgeNetwork: d.EdgeNetwork, DataVolume: d.DataVolume, SourceSubpath: sourceSubpath})
+		candidate, err := d.Docker.CreateServiceContainer(ctx, request)
 		if err != nil {
 			return fmt.Errorf("create %s: %w", svc.Name, err)
 		}
 		candidates[svc.ID] = candidate
-		if err = d.Docker.WaitReady(ctx, candidate.ID, 90*time.Second, log); err != nil {
+		readiness := dockerx.ReadinessFor(svc)
+		if err = d.Docker.WaitReady(ctx, candidate.ID, readiness, log); err != nil {
 			return fmt.Errorf("health %s: %w", svc.Name, err)
 		}
 		if svc.Public && svc.Port > 0 && svc.HealthPath != "" {
 			endpoint := fmt.Sprintf("http://%s:%d%s", candidate.Name, svc.Port, svc.HealthPath)
 			log("Checking HTTP readiness for " + svc.Name)
-			if err = d.Docker.WaitHTTPReady(ctx, endpoint, 90*time.Second, log); err != nil {
+			if err = d.Docker.WaitHTTPReady(ctx, endpoint, readiness.Timeout, log); err != nil {
 				return fmt.Errorf("HTTP health %s: %w", svc.Name, err)
 			}
 		}
 	}
 	progress(70, "Switching routes atomically")
-	if err = d.switchRelease(ctx, project, services, release.ID, candidates, old, log); err != nil {
+	if err = d.switchRelease(ctx, project, services, release.ID, candidates, kept, old, log); err != nil {
 		return err
 	}
 	progress(82, "Retiring the previous release")
@@ -242,6 +280,19 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	return nil
 }
 
+// createMountDirectory creates the source-tree directory a project-relative
+// mount needs when the project does not ship it, and does nothing when the path
+// already exists — including when it exists as a file, which is the case for
+// every config file a project mounts and must never be replaced by a directory.
+func createMountDirectory(target string) error {
+	if _, err := os.Stat(target); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.MkdirAll(target, composecfg.SourceDirMode)
+}
+
 // sourceSubpath expresses a project's source directory relative to the data
 // directory, which is exactly its path inside the mounted data volume.
 func (d *Deployer) sourceSubpath(project store.Project) (string, error) {
@@ -253,6 +304,58 @@ func (d *Deployer) sourceSubpath(project store.Project) (string, error) {
 		return "", fmt.Errorf("project source %s is outside the Asgard data directory", project.SourcePath)
 	}
 	return filepath.ToSlash(relative), nil
+}
+
+// specHash fingerprints the container a request would create. An empty result
+// only means the running container cannot be compared, so the service is
+// recreated as it always was.
+func (d *Deployer) specHash(ctx context.Context, request dockerx.CreateRequest) string {
+	imageID, err := d.Docker.ImageID(ctx, request.Image)
+	if err != nil {
+		return ""
+	}
+	hash, err := dockerx.SpecHash(request, imageID)
+	if err != nil {
+		return ""
+	}
+	return hash
+}
+
+// unchanged returns the previous release's container for svc when this release
+// would create an identical one and the running one is in good health — the
+// way `docker compose up` leaves an unchanged service alone. Recreating it
+// would only cost a stop, a start, and a readiness wait, and for a database
+// it is a restart nobody asked for.
+func (d *Deployer) unchanged(ctx context.Context, svc store.Service, spec string, prior store.Runtime) (dockerx.Container, bool) {
+	if spec == "" || prior.DockerID == "" || !keepable(svc) {
+		return dockerx.Container{}, false
+	}
+	current, err := d.Docker.Container(ctx, prior.DockerID)
+	if err != nil || current.Labels[dockerx.LabelSpec] != spec {
+		return dockerx.Container{}, false
+	}
+	if current.State != "running" || (current.Health != "" && current.Health != "healthy") {
+		return dockerx.Container{}, false
+	}
+	return current, true
+}
+
+// keepable reports whether a service's container may be carried into a new
+// release at all. A one-shot job is run again, as it always was: whatever it
+// prepares, the release expects it freshly done. A service that mounts paths
+// from the project source is always recreated, because a re-sync replaces the
+// source tree wholesale and a running container still holds the tree that
+// was there when it started.
+func keepable(svc store.Service) bool {
+	if dockerx.ReadinessFor(svc).Job {
+		return false
+	}
+	for _, spec := range svc.Volumes {
+		if _, isProjectMount := composecfg.ProjectMount(spec); isProjectMount {
+			return false
+		}
+	}
+	return true
 }
 
 func stopPriorBeforeCandidate(svc store.Service) bool {
@@ -272,7 +375,7 @@ func candidatesForDocker(items map[string]dockerx.Container, id string) (dockerx
 	return dockerx.Container{}, false
 }
 
-func (d *Deployer) switchRelease(ctx context.Context, project store.Project, services []store.Service, releaseID string, candidates map[string]dockerx.Container, old map[string]store.Runtime, log func(string)) error {
+func (d *Deployer) switchRelease(ctx context.Context, project store.Project, services []store.Service, releaseID string, candidates map[string]dockerx.Container, kept map[string]bool, old map[string]store.Runtime, log func(string)) error {
 	runtimeRows := map[string]struct{ DockerID, Name, ImageID, State string }{}
 	for serviceID, item := range candidates {
 		runtimeRows[serviceID] = struct{ DockerID, Name, ImageID, State string }{item.ID, item.Name, item.ImageID, item.State}
@@ -287,6 +390,15 @@ func (d *Deployer) switchRelease(ctx context.Context, project store.Project, ser
 		return err
 	}
 	for serviceID, item := range runtimeRows {
+		if kept[serviceID] {
+			// A container carried over unchanged keeps its one runtime row, and
+			// with it the release that created it — which is the release whose
+			// image it runs. Only its active flag returns.
+			if _, err = tx.ExecContext(ctx, `UPDATE runtime_containers SET active=1,updated_at=? WHERE docker_id=?`, now, item.DockerID); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO runtime_containers(id,project_id,service_id,release_id,docker_id,docker_name,image_id,state,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)`, uuid.NewString(), project.ID, serviceID, releaseID, item.DockerID, item.Name, item.ImageID, item.State, now, now); err != nil {
 			return err
 		}
@@ -330,13 +442,21 @@ func (d *Deployer) switchRelease(ctx context.Context, project store.Project, ser
 		}
 		endpoint := "https://" + svc.Hostname + svc.HealthPath
 		log("Confirming edge readiness for " + svc.Name)
-		if err = d.Docker.WaitHTTPReady(ctx, endpoint, 90*time.Second, log); err != nil {
+		if err = d.Docker.WaitHTTPReady(ctx, endpoint, dockerx.ReadinessTimeout(svc), log); err != nil {
 			rollback()
 			return fmt.Errorf("confirm edge route %s: %w", svc.Name, err)
 		}
 	}
 	d.reclaim(ctx, log)
 	return nil
+}
+
+// holdBuilds keeps storage reclamation from running during an image build.
+func (d *Deployer) holdBuilds() (release func()) {
+	if d.Reclaimer == nil {
+		return func() {}
+	}
+	return d.Reclaimer.HoldBuilds()
 }
 
 // reclaim frees images left by releases that have aged past the retention
@@ -361,7 +481,7 @@ func (d *Deployer) reclaim(ctx context.Context, log func(string)) {
 func releaseToServices(items []store.ReleaseService) []store.Service {
 	out := make([]store.Service, 0, len(items))
 	for _, item := range items {
-		out = append(out, store.Service{ID: item.ServiceID, Name: item.Name, Role: item.Role, Image: item.ImageRef, Command: item.Command, Environment: item.Environment, Public: item.Public, Port: item.Port, Hostname: item.Hostname, HealthPath: item.HealthPath, CPULimit: item.CPULimit, MemoryLimit: item.MemoryLimit, PIDsLimit: item.PIDsLimit, RestartPolicy: item.RestartPolicy, DependsOn: item.DependsOn, Volumes: item.Volumes})
+		out = append(out, store.Service{ID: item.ServiceID, Name: item.Name, Role: item.Role, Image: item.ImageRef, Command: item.Command, Environment: item.Environment, Container: item.Container, Public: item.Public, Port: item.Port, Hostname: item.Hostname, HealthPath: item.HealthPath, CPULimit: item.CPULimit, MemoryLimit: item.MemoryLimit, PIDsLimit: item.PIDsLimit, RestartPolicy: item.RestartPolicy, DependsOn: item.DependsOn, Volumes: item.Volumes})
 	}
 	return out
 }

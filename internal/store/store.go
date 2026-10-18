@@ -126,19 +126,101 @@ type Service struct {
 	HealthPath   string            `json:"healthPath"`
 	// HSTSMode chooses the Strict-Transport-Security policy for this service's
 	// public route. Empty derives it from the hostname's zone; see hsts.go.
-	HSTSMode       string       `json:"hstsMode"`
-	CPULimit       float64      `json:"cpuLimit"`
-	MemoryLimit    int64        `json:"memoryLimit"`
-	PIDsLimit      int64        `json:"pidsLimit"`
-	RestartPolicy  string       `json:"restartPolicy"`
-	DependsOn      []string     `json:"dependsOn"`
-	Volumes        []string     `json:"volumes"`
-	Networks       []NetworkRef `json:"networks,omitempty"`
-	ConfigRevision int          `json:"configRevision"`
-	CreatedAt      time.Time    `json:"createdAt"`
-	UpdatedAt      time.Time    `json:"updatedAt"`
-	Runtime        *Runtime     `json:"runtime,omitempty"`
-	Metrics        *Metrics     `json:"metrics,omitempty"`
+	HSTSMode string `json:"hstsMode"`
+	// Container holds the container-level configuration the Compose file
+	// declares: its entrypoint, user, working directory, labels, healthcheck,
+	// and the kernel and storage settings a service is allowed to ask for.
+	// None of it has an operator-editable equivalent — Compose owns these
+	// fields, and a deployment replaces them from the file — so they travel
+	// together instead of widening this struct one column at a time.
+	Container      ContainerConfig `json:"container"`
+	CPULimit       float64         `json:"cpuLimit"`
+	MemoryLimit    int64           `json:"memoryLimit"`
+	PIDsLimit      int64           `json:"pidsLimit"`
+	RestartPolicy  string          `json:"restartPolicy"`
+	DependsOn      []string        `json:"dependsOn"`
+	Volumes        []string        `json:"volumes"`
+	Networks       []NetworkRef    `json:"networks,omitempty"`
+	ConfigRevision int             `json:"configRevision"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
+	Runtime        *Runtime        `json:"runtime,omitempty"`
+	Metrics        *Metrics        `json:"metrics,omitempty"`
+}
+
+// ContainerConfig is what a Compose file declares about a service beyond the
+// service's own identity, route, and limits: how its container runs, and how
+// its image is built.
+//
+// The zero value means "the image's own defaults and a plain build", which is
+// what most services want; every field here is absent unless the file asked for
+// it. Durations are held as time.Duration so a healthcheck can be applied to
+// the container without re-parsing the Compose file at deploy time. None of it
+// is operator-editable: the file is the only author, and a deployment replaces
+// it wholesale, so a release carries these settings rather than the current
+// file.
+type ContainerConfig struct {
+	// Entrypoint overrides the image's ENTRYPOINT. A pointer distinguishes
+	// "not declared" from an explicitly empty list.
+	Entrypoint *[]string `json:"entrypoint,omitempty"`
+	// WorkingDir is the container's working directory.
+	WorkingDir string `json:"workingDir,omitempty"`
+	// User is the uid, name, or uid:gid the process runs as.
+	User string `json:"user,omitempty"`
+	// ContainerHostname is the container's own hostname. It is not the public
+	// route hostname, which lives on the service.
+	ContainerHostname string `json:"containerHostname,omitempty"`
+	// Labels are extra container labels. Asgard's own labels always win.
+	Labels map[string]string `json:"labels,omitempty"`
+	// Healthcheck is applied to the container, so the platform's readiness
+	// gate and the file's own health definition agree on what healthy means.
+	Healthcheck *Healthcheck `json:"healthcheck,omitempty"`
+	// ReadOnly mounts the container's root filesystem read-only.
+	ReadOnly bool `json:"readOnly,omitempty"`
+	// ShmSize overrides the size of /dev/shm in bytes.
+	ShmSize int64 `json:"shmSize,omitempty"`
+	// StopSignal is the signal sent to stop the container.
+	StopSignal string `json:"stopSignal,omitempty"`
+	// StopTimeoutSeconds is how long the container has to shut down after it.
+	StopTimeoutSeconds int `json:"stopTimeoutSeconds,omitempty"`
+	// Tmpfs are in-memory mounts inside the container, path to options.
+	Tmpfs map[string]string `json:"tmpfs,omitempty"`
+	// Sysctls are namespaced kernel settings for the container.
+	Sysctls map[string]string `json:"sysctls,omitempty"`
+	// Ulimits are the resource limits the process starts with.
+	Ulimits []Ulimit `json:"ulimits,omitempty"`
+	// Platform pins the image's platform, as os/arch[/variant].
+	Platform string `json:"platform,omitempty"`
+	// BuildTarget is the stage of a multi-stage Dockerfile to build, from
+	// Compose's build.target. A file that names a development stage expects
+	// that stage's image, so building the final one instead would run something
+	// else entirely.
+	BuildTarget string `json:"buildTarget,omitempty"`
+	// BuildArgs are the build-time arguments Compose passes to the builder.
+	BuildArgs map[string]string `json:"buildArgs,omitempty"`
+	// NetworkAliases are extra names the service answers to on the project
+	// network, taken from Compose's per-network aliases.
+	NetworkAliases []string `json:"networkAliases,omitempty"`
+}
+
+// Healthcheck is a Compose healthcheck in the form the container runtime
+// wants: an exec or shell command plus its schedule.
+type Healthcheck struct {
+	// Test is the command, in Docker's form: {"CMD", ...}, {"CMD-SHELL", ...},
+	// or {"NONE"} to disable a healthcheck the image declares.
+	Test          []string      `json:"test,omitempty"`
+	Interval      time.Duration `json:"interval,omitempty"`
+	Timeout       time.Duration `json:"timeout,omitempty"`
+	StartPeriod   time.Duration `json:"startPeriod,omitempty"`
+	StartInterval time.Duration `json:"startInterval,omitempty"`
+	Retries       int           `json:"retries,omitempty"`
+}
+
+// Ulimit is one process resource limit.
+type Ulimit struct {
+	Name string `json:"name"`
+	Soft int64  `json:"soft"`
+	Hard int64  `json:"hard"`
 }
 
 type NetworkRef struct {
@@ -321,16 +403,16 @@ func projectStatus(services []Service) string {
 }
 
 func (s *Store) ListServices(ctx context.Context, projectID string) ([]Service, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,config_revision,created_at,updated_at FROM services WHERE project_id=? ORDER BY name`, projectID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,config_json,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,config_revision,created_at,updated_at FROM services WHERE project_id=? ORDER BY name`, projectID)
 	if err != nil {
 		return nil, err
 	}
 	services := []Service{}
 	for rows.Next() {
 		var svc Service
-		var cmdJSON, envJSON, depsJSON, volumesJSON, created, updated string
+		var cmdJSON, envJSON, configJSON, depsJSON, volumesJSON, created, updated string
 		var public int
-		if err := rows.Scan(&svc.ID, &svc.ProjectID, &svc.Name, &svc.Role, &svc.Image, &svc.BuildContext, &svc.Dockerfile, &cmdJSON, &envJSON, &public, &svc.Port, &svc.Hostname, &svc.HealthPath, &svc.HSTSMode, &svc.CPULimit, &svc.MemoryLimit, &svc.PIDsLimit, &svc.RestartPolicy, &depsJSON, &volumesJSON, &svc.ConfigRevision, &created, &updated); err != nil {
+		if err := rows.Scan(&svc.ID, &svc.ProjectID, &svc.Name, &svc.Role, &svc.Image, &svc.BuildContext, &svc.Dockerfile, &cmdJSON, &envJSON, &public, &svc.Port, &svc.Hostname, &svc.HealthPath, &svc.HSTSMode, &configJSON, &svc.CPULimit, &svc.MemoryLimit, &svc.PIDsLimit, &svc.RestartPolicy, &depsJSON, &volumesJSON, &svc.ConfigRevision, &created, &updated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -340,6 +422,7 @@ func (s *Store) ListServices(ctx context.Context, projectID string) ([]Service, 
 		_ = json.Unmarshal([]byte(envJSON), &svc.Environment)
 		_ = json.Unmarshal([]byte(depsJSON), &svc.DependsOn)
 		_ = json.Unmarshal([]byte(volumesJSON), &svc.Volumes)
+		_ = json.Unmarshal([]byte(configJSON), &svc.Container)
 		services = append(services, svc)
 	}
 	if err := rows.Err(); err != nil {
@@ -408,9 +491,10 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 	for _, svc := range services {
 		cmd, _ := json.Marshal(svc.Command)
 		env, _ := json.Marshal(svc.Environment)
+		config, _ := json.Marshal(svc.Container)
 		deps, _ := json.Marshal(svc.DependsOn)
 		vols, _ := json.Marshal(svc.Volumes)
-		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,config_json,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, string(config), svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
 		if err != nil {
 			return err
 		}
@@ -442,9 +526,10 @@ func (s *Store) AddService(ctx context.Context, svc Service) error {
 	now := Now()
 	cmd, _ := json.Marshal(svc.Command)
 	env, _ := json.Marshal(svc.Environment)
+	config, _ := json.Marshal(svc.Container)
 	deps, _ := json.Marshal(svc.DependsOn)
 	vols, _ := json.Marshal(svc.Volumes)
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, svc.ProjectID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,config_json,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, svc.ProjectID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, string(config), svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
 	if err != nil {
 		return err
 	}

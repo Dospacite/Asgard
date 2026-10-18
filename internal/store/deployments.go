@@ -32,6 +32,7 @@ type ReleaseService struct {
 	ImageRef      string            `json:"imageRef"`
 	Command       []string          `json:"command"`
 	Environment   map[string]string `json:"environment"`
+	Container     ContainerConfig   `json:"container"`
 	Public        bool              `json:"public"`
 	Port          int               `json:"port"`
 	Hostname      string            `json:"hostname"`
@@ -78,9 +79,10 @@ func (s *Store) BeginRelease(ctx context.Context, projectID, operationID, trigge
 	for _, svc := range services {
 		cmd, _ := json.Marshal(svc.Command)
 		env, _ := json.Marshal(svc.Environment)
+		config, _ := json.Marshal(svc.Container)
 		deps, _ := json.Marshal(svc.DependsOn)
 		volumes, _ := json.Marshal(svc.Volumes)
-		_, err = tx.ExecContext(ctx, `INSERT INTO release_services(id,release_id,service_id,name,role,image_ref,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, uuid.NewString(), release.ID, svc.ID, svc.Name, svc.Role, svc.Image, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(volumes))
+		_, err = tx.ExecContext(ctx, `INSERT INTO release_services(id,release_id,service_id,name,role,image_ref,command_json,env_json,config_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, uuid.NewString(), release.ID, svc.ID, svc.Name, svc.Role, svc.Image, string(cmd), string(env), string(config), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(volumes))
 		if err != nil {
 			return Release{}, Deployment{}, err
 		}
@@ -182,10 +184,15 @@ func (s *Store) ListDeployments(ctx context.Context, projectID string, limit int
 	for rows.Next() {
 		var d Deployment
 		var started string
-		var finished sql.NullString
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.ReleaseID, &d.OperationID, &d.Status, &d.TriggerType, &d.Error, &started, &finished); err != nil {
+		// release_id and finished_at are both nullable: a run that has not
+		// finished has no end time, and a run whose release has aged out of the
+		// retention window has no release — the foreign key nulls it rather
+		// than deleting the history of the deployment.
+		var release, finished sql.NullString
+		if err := rows.Scan(&d.ID, &d.ProjectID, &release, &d.OperationID, &d.Status, &d.TriggerType, &d.Error, &started, &finished); err != nil {
 			return nil, err
 		}
+		d.ReleaseID = release.String
 		d.StartedAt = parseTime(started)
 		d.FinishedAt = parseTimePtr(finished)
 		out = append(out, d)
@@ -208,7 +215,7 @@ func (s *Store) GetRelease(ctx context.Context, id string) (Release, error) {
 }
 
 func (s *Store) ReleaseServices(ctx context.Context, releaseID string) ([]ReleaseService, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,release_id,service_id,name,role,image_ref,command_json,env_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json FROM release_services WHERE release_id=? ORDER BY name`, releaseID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,release_id,service_id,name,role,image_ref,command_json,env_json,config_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json FROM release_services WHERE release_id=? ORDER BY name`, releaseID)
 	if err != nil {
 		return nil, err
 	}
@@ -216,14 +223,15 @@ func (s *Store) ReleaseServices(ctx context.Context, releaseID string) ([]Releas
 	out := []ReleaseService{}
 	for rows.Next() {
 		var item ReleaseService
-		var command, environment, depends, volumes string
+		var command, environment, config, depends, volumes string
 		var public int
-		if err := rows.Scan(&item.ID, &item.ReleaseID, &item.ServiceID, &item.Name, &item.Role, &item.ImageRef, &command, &environment, &public, &item.Port, &item.Hostname, &item.HealthPath, &item.CPULimit, &item.MemoryLimit, &item.PIDsLimit, &item.RestartPolicy, &depends, &volumes); err != nil {
+		if err := rows.Scan(&item.ID, &item.ReleaseID, &item.ServiceID, &item.Name, &item.Role, &item.ImageRef, &command, &environment, &config, &public, &item.Port, &item.Hostname, &item.HealthPath, &item.CPULimit, &item.MemoryLimit, &item.PIDsLimit, &item.RestartPolicy, &depends, &volumes); err != nil {
 			return nil, err
 		}
 		item.Public = public != 0
 		_ = json.Unmarshal([]byte(command), &item.Command)
 		_ = json.Unmarshal([]byte(environment), &item.Environment)
+		_ = json.Unmarshal([]byte(config), &item.Container)
 		_ = json.Unmarshal([]byte(depends), &item.DependsOn)
 		_ = json.Unmarshal([]byte(volumes), &item.Volumes)
 		out = append(out, item)

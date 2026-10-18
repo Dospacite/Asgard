@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/rousoftware/asgard/internal/httpx"
-	"github.com/rousoftware/asgard/internal/reclaim"
 )
 
 // storageReclaim frees Docker artifacts Asgard itself created.
@@ -31,7 +30,7 @@ func (s *Server) storageReclaim(w http.ResponseWriter, r *http.Request) {
 	}
 	// A per-request policy override must not mutate the shared reclaimer the
 	// scheduled sweep and the deployer both hold.
-	scoped := &reclaim.Reclaimer{Store: s.Store, Docker: s.Docker, Policy: policy}
+	scoped := s.Reclaimer.WithPolicy(policy)
 	result, err := scoped.Run(r.Context())
 	if err != nil {
 		writeError(w, err)

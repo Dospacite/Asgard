@@ -591,6 +591,12 @@ label small { color: var(--ink-55); font-size: 10px; font-weight: 500; }
 .service-picker { width: min(240px,40vw); color: var(--ink-72); font-size: 11px; font-weight: 650; }
 .service-picker select { margin-top: 6px; }
 .environment-panel > .source-issues { margin: 16px 20px 0; }
+/* An accepted-with-caveat list: the file imported, and these keys are not
+   being honored. Same shape as the error list, different verdict. */
+.source-issues--warn { border-color: rgba(198,63,0,.28); color: var(--orange); background: rgba(198,63,0,.06); }
+.import-caveats { margin: 9px 0 0; padding-left: 18px; color: var(--ink-72); font-size: 12px; line-height: 1.6; }
+.import-caveats code { color: var(--orange); }
+.source-issues--warn code { color: var(--orange); }
 .environment-list { padding: 8px 20px; }
 .environment-row { min-height: 70px; display: grid; grid-template-columns: 24px minmax(150px,.8fr) auto minmax(220px,1.2fr) minmax(110px,auto); align-items: center; gap: 12px; border-bottom: 1px solid var(--ink-10); }
 .environment-row:last-child { border-bottom: 0; }

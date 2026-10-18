@@ -5,11 +5,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -20,27 +23,39 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
+	"github.com/docker/go-units"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
+	"github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/rousoftware/asgard/internal/store"
 )
 
 const LabelManaged = "com.rousoftware.asgard.managed"
 
+// LabelSpec records the SpecHash a container was created from, so a later
+// release can tell whether it would create exactly the same container.
+const LabelSpec = "com.rousoftware.asgard.spec"
+
 type Engine struct{ client *client.Client }
 
 type Container struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Image     string            `json:"image"`
-	ImageID   string            `json:"imageId"`
-	State     string            `json:"state"`
-	Status    string            `json:"status"`
-	Health    string            `json:"health"`
-	Restarts  int               `json:"restarts"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Image    string `json:"image"`
+	ImageID  string `json:"imageId"`
+	State    string `json:"state"`
+	Status   string `json:"status"`
+	Health   string `json:"health"`
+	Restarts int    `json:"restarts"`
+	// ExitCode is the status a stopped container left behind. The readiness
+	// gate reads it for one-shot services, where finishing successfully is the
+	// goal rather than a failure.
+	ExitCode  int               `json:"exitCode"`
 	CreatedAt time.Time         `json:"createdAt"`
 	SizeRW    int64             `json:"sizeRw"`
 	Labels    map[string]string `json:"labels"`
@@ -456,6 +471,18 @@ func NormalizeImage(value string) (string, error) {
 	return named.String(), nil
 }
 
+// ImageExists reports whether the daemon already holds an image under this
+// reference. A rollback needs it: the image a release ran is kept on the host
+// for the retention window, and a tag Asgard built itself has never been
+// published anywhere, so asking a registry for it fails with "pull access
+// denied" while the image sits in the local store.
+func (e *Engine) ImageExists(ctx context.Context, image string) bool {
+	if _, err := e.client.ImageInspect(ctx, image); err != nil {
+		return false
+	}
+	return true
+}
+
 func (e *Engine) Pull(ctx context.Context, image string, log func(string)) error {
 	normalized, err := NormalizeImage(image)
 	if err != nil {
@@ -485,10 +512,76 @@ func (e *Engine) Pull(ctx context.Context, image string, log func(string)) error
 	return scanner.Err()
 }
 
-func (e *Engine) Build(ctx context.Context, contextDir, dockerfile, tag string, log func(string)) error {
+func (e *Engine) Build(ctx context.Context, contextDir, dockerfile, tag, target string, buildArgs map[string]string, log func(string)) error {
+	args := map[string]*string{}
+	for key, value := range buildArgs {
+		arguments := value
+		args[key] = &arguments
+	}
+	// BuildKit is the builder, not a fallback. The legacy builder keeps a
+	// multi-stage file's earlier stages as untagged images, which is the only
+	// place their cache lives — and an untagged image is exactly what storage
+	// reclamation removes after every release, so each deployment rebuilt those
+	// stages from nothing. BuildKit keeps that cache in the build cache, bounded
+	// by its own budget, and also skips stages the target does not need, runs
+	// independent stages in parallel, and supports `RUN --mount=type=cache`.
+	options := client.ImageBuildOptions{Tags: []string{tag}, Dockerfile: filepath.ToSlash(dockerfile), Target: target, BuildArgs: args, PullParent: true, Labels: map[string]string{LabelManaged: "true"}, Version: build.BuilderBuildKit}
+	err := e.buildKit(ctx, contextDir, options, log)
+	if err == nil || !needsLegacyBuilder(err.Error()) {
+		return err
+	}
+	log("BuildKit could not run this build (" + err.Error() + "); retrying on the legacy builder, which keeps no cache for earlier build stages.")
+	legacy := options
+	legacy.Version = build.BuilderV1
+	legacy.Remove, legacy.ForceRemove = true, true
+	return e.buildWith(ctx, contextDir, legacy, log)
+}
+
+// buildKit runs a build on BuildKit under a client session.
+//
+// Some daemons — Docker 29.3, for one — refuse to resolve even a public base
+// image for a build that has no session, failing every build with "no active
+// sessions". The session offers no services: with no credentials to give,
+// BuildKit pulls anonymously, exactly as the legacy builder does, and the
+// build context still travels as the request body.
+func (e *Engine) buildKit(ctx context.Context, contextDir string, options client.ImageBuildOptions, log func(string)) error {
+	buildSession, err := session.NewSession(ctx, "asgard-build")
+	if err != nil {
+		return err
+	}
+	sessionCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		_ = buildSession.Run(sessionCtx, func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
+			return e.client.DialHijack(ctx, "/session", proto, meta)
+		})
+	}()
+	defer buildSession.Close()
+	options.SessionID = buildSession.ID()
+	return e.buildWith(ctx, contextDir, options, log)
+}
+
+// needsLegacyBuilder reports whether BuildKit refused a build for a reason the
+// legacy builder does not share, rather than because the Dockerfile failed: a
+// daemon without BuildKit, or one that would not accept the build's session. A
+// Dockerfile that is simply broken must fail once, not be rebuilt a second
+// time on another builder.
+func needsLegacyBuilder(message string) bool {
+	message = strings.ToLower(message)
+	if strings.Contains(message, "no active session") {
+		return true
+	}
+	if !strings.Contains(message, "buildkit") {
+		return false
+	}
+	return strings.Contains(message, "not supported") || strings.Contains(message, "not enabled")
+}
+
+// buildWith streams one build and returns the builder's own error.
+func (e *Engine) buildWith(ctx context.Context, contextDir string, options client.ImageBuildOptions, log func(string)) error {
 	reader, writer := io.Pipe()
 	go func() { err := writeBuildContext(writer, contextDir); _ = writer.CloseWithError(err) }()
-	result, err := e.client.ImageBuild(ctx, reader, client.ImageBuildOptions{Tags: []string{tag}, Dockerfile: filepath.ToSlash(dockerfile), Remove: true, ForceRemove: true, PullParent: true, Labels: map[string]string{LabelManaged: "true"}})
+	result, err := e.client.ImageBuild(ctx, reader, options)
 	if err != nil {
 		return err
 	}
@@ -496,13 +589,21 @@ func (e *Engine) Build(ctx context.Context, contextDir, dockerfile, tag string, 
 	scanner := bufio.NewScanner(result.Body)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
 	var buildErr error
+	progress := newBuildKitProgress(log)
+	defer progress.flush()
 	for scanner.Scan() {
 		var message struct {
-			Stream string `json:"stream"`
-			Error  string `json:"error"`
-			Status string `json:"status"`
+			Stream string          `json:"stream"`
+			Error  string          `json:"error"`
+			Status string          `json:"status"`
+			ID     string          `json:"id"`
+			Aux    json.RawMessage `json:"aux"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &message) == nil {
+			if message.ID == buildKitTraceID {
+				progress.handle(message.Aux)
+				continue
+			}
 			for _, line := range strings.Split(strings.TrimSpace(message.Stream), "\n") {
 				if line != "" {
 					log(line)
@@ -597,35 +698,17 @@ type CreateRequest struct {
 	// secret file works without ever exposing a host path to the workload.
 	DataVolume    string
 	SourceSubpath string
+	// SpecHash is stamped on the container as LabelSpec when set.
+	SpecHash string
 }
 
 func (e *Engine) CreateServiceContainer(ctx context.Context, req CreateRequest) (Container, error) {
 	name := fmt.Sprintf("asgard-%s-%s-r%d", req.Project.Slug, normalizeName(req.Service.Name), req.Version)
-	env := make([]string, 0, len(req.Service.Environment))
-	for key, value := range req.Service.Environment {
-		env = append(env, key+"="+value)
-	}
-	sort.Strings(env)
-	ports := network.PortSet{}
-	if req.Service.Port > 0 {
-		ports[network.MustParsePort(fmt.Sprintf("%d/tcp", req.Service.Port))] = struct{}{}
-	}
-	labels := map[string]string{LabelManaged: "true", "com.rousoftware.asgard.project-id": req.Project.ID, "com.rousoftware.asgard.project": req.Project.Slug, "com.rousoftware.asgard.service-id": req.Service.ID, "com.rousoftware.asgard.service": req.Service.Name, "com.rousoftware.asgard.release-id": req.ReleaseID, "com.rousoftware.asgard.version": strconv.Itoa(req.Version)}
-	mounts, err := buildMounts(req)
+	config, hostConfig, endpoints, platform, err := containerSpec(req, name)
 	if err != nil {
 		return Container{}, err
 	}
-	pids := req.Service.PIDsLimit
-	initProcess := true
-	hostConfig := &container.HostConfig{NetworkMode: container.NetworkMode(req.ProjectNetwork), RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyMode(req.Service.RestartPolicy)}, Resources: container.Resources{Memory: req.Service.MemoryLimit, NanoCPUs: int64(req.Service.CPULimit * 1e9), PidsLimit: &pids}, Mounts: mounts, LogConfig: container.LogConfig{Type: "local", Config: map[string]string{"max-size": "10m", "max-file": "5"}}, Init: &initProcess, CapDrop: []string{"ALL"}, CapAdd: workloadCapabilities(), SecurityOpt: []string{"no-new-privileges:true"}}
-	endpoints := map[string]*network.EndpointSettings{req.ProjectNetwork: {Aliases: []string{name, req.Service.Name}}}
-	if req.Service.Public {
-		endpoints[req.EdgeNetwork] = &network.EndpointSettings{Aliases: []string{name}}
-	}
-	for _, shared := range req.Service.Networks {
-		endpoints[shared.DockerName] = &network.EndpointSettings{Aliases: []string{name, shared.Alias}}
-	}
-	createResult, err := e.client.ContainerCreate(ctx, client.ContainerCreateOptions{Config: &container.Config{Image: req.Image, Env: env, Cmd: req.Service.Command, Labels: labels, ExposedPorts: ports}, HostConfig: hostConfig, NetworkingConfig: &network.NetworkingConfig{EndpointsConfig: endpoints}, Name: name})
+	createResult, err := e.client.ContainerCreate(ctx, client.ContainerCreateOptions{Config: config, HostConfig: hostConfig, NetworkingConfig: &network.NetworkingConfig{EndpointsConfig: endpoints}, Platform: platform, Name: name})
 	if err != nil {
 		return Container{}, err
 	}
@@ -634,6 +717,160 @@ func (e *Engine) CreateServiceContainer(ctx context.Context, req CreateRequest) 
 		return Container{}, err
 	}
 	return e.Container(ctx, createResult.ID)
+}
+
+// containerSpec renders a service into the request Docker is given. It is
+// deliberately a pure function of the request: everything an imported Compose
+// file can say about a container is visible in one place, and the mapping can
+// be tested without a Docker daemon.
+//
+// The limits Asgard owns — caps, seccomp, no-new-privileges, the log driver,
+// the init process, and the resource ceilings — are always applied last, so
+// nothing a project declares can widen them.
+func containerSpec(req CreateRequest, name string) (*container.Config, *container.HostConfig, map[string]*network.EndpointSettings, *v1.Platform, error) {
+	service := req.Service
+	extra := service.Container
+	env := make([]string, 0, len(service.Environment))
+	for key, value := range service.Environment {
+		env = append(env, key+"="+value)
+	}
+	sort.Strings(env)
+	ports := network.PortSet{}
+	if service.Port > 0 {
+		ports[network.MustParsePort(fmt.Sprintf("%d/tcp", service.Port))] = struct{}{}
+	}
+	labels := map[string]string{LabelManaged: "true", "com.rousoftware.asgard.project-id": req.Project.ID, "com.rousoftware.asgard.project": req.Project.Slug, "com.rousoftware.asgard.service-id": service.ID, "com.rousoftware.asgard.service": service.Name, "com.rousoftware.asgard.release-id": req.ReleaseID, "com.rousoftware.asgard.version": strconv.Itoa(req.Version)}
+	if req.SpecHash != "" {
+		labels[LabelSpec] = req.SpecHash
+	}
+	for key, value := range extra.Labels {
+		// A project's own labels are kept, but never at the expense of the ones
+		// the control plane needs to find and correlate its containers.
+		if _, reserved := labels[key]; !reserved && !strings.HasPrefix(key, "com.rousoftware.asgard.") {
+			labels[key] = value
+		}
+	}
+	mounts, err := buildMounts(req)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	policyName, retries := composecfg.RestartPolicy(service.RestartPolicy)
+	pids := service.PIDsLimit
+	initProcess := true
+	hostConfig := &container.HostConfig{
+		NetworkMode:    container.NetworkMode(req.ProjectNetwork),
+		RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyMode(policyName), MaximumRetryCount: retries},
+		Resources:      container.Resources{Memory: service.MemoryLimit, NanoCPUs: int64(service.CPULimit * 1e9), PidsLimit: &pids, Ulimits: ulimits(extra.Ulimits)},
+		Mounts:         mounts,
+		ReadonlyRootfs: extra.ReadOnly,
+		ShmSize:        extra.ShmSize,
+		Tmpfs:          extra.Tmpfs,
+		Sysctls:        extra.Sysctls,
+		LogConfig:      container.LogConfig{Type: "local", Config: map[string]string{"max-size": "10m", "max-file": "5"}},
+		Init:           &initProcess,
+		CapDrop:        []string{"ALL"},
+		CapAdd:         workloadCapabilities(),
+		SecurityOpt:    []string{"no-new-privileges:true"},
+	}
+	config := &container.Config{
+		Image:        req.Image,
+		Env:          env,
+		Cmd:          service.Command,
+		Labels:       labels,
+		ExposedPorts: ports,
+		WorkingDir:   extra.WorkingDir,
+		User:         extra.User,
+		Hostname:     extra.ContainerHostname,
+		StopSignal:   extra.StopSignal,
+	}
+	if extra.Entrypoint != nil {
+		config.Entrypoint = *extra.Entrypoint
+	}
+	if extra.StopTimeoutSeconds > 0 {
+		timeout := extra.StopTimeoutSeconds
+		config.StopTimeout = &timeout
+	}
+	if health := extra.Healthcheck; health != nil {
+		config.Healthcheck = &container.HealthConfig{Test: health.Test, Interval: health.Interval, Timeout: health.Timeout, StartPeriod: health.StartPeriod, StartInterval: health.StartInterval, Retries: health.Retries}
+	}
+	var platform *v1.Platform
+	if extra.Platform != "" {
+		parsed, err := parsePlatform(extra.Platform)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		platform = parsed
+	}
+	aliases := append([]string{name, service.Name}, extra.NetworkAliases...)
+	endpoints := map[string]*network.EndpointSettings{req.ProjectNetwork: {Aliases: aliases}}
+	if service.Public {
+		endpoints[req.EdgeNetwork] = &network.EndpointSettings{Aliases: []string{name}}
+	}
+	for _, shared := range service.Networks {
+		endpoints[shared.DockerName] = &network.EndpointSettings{Aliases: []string{name, shared.Alias}}
+	}
+	return config, hostConfig, endpoints, platform, nil
+}
+
+// SpecHash fingerprints the container a request would create from imageID,
+// leaving out everything that names the release rather than describes the
+// container: the release ID and version labels, and the versioned container
+// name. Two releases with the same hash would create identical containers, so
+// the running one can simply be kept.
+func SpecHash(req CreateRequest, imageID string) (string, error) {
+	req.ReleaseID, req.Version, req.SpecHash, req.Image = "", 0, "", imageID
+	name := fmt.Sprintf("asgard-%s-%s", req.Project.Slug, normalizeName(req.Service.Name))
+	config, hostConfig, endpoints, platform, err := containerSpec(req, name)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(struct {
+		Config    *container.Config
+		Host      *container.HostConfig
+		Endpoints map[string]*network.EndpointSettings
+		Platform  *v1.Platform
+	}{config, hostConfig, endpoints, platform})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return "v1:" + hex.EncodeToString(sum[:]), nil
+}
+
+// ImageID resolves an image reference to the ID a container created from it
+// reports.
+func (e *Engine) ImageID(ctx context.Context, ref string) (string, error) {
+	result, err := e.client.ImageInspect(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return result.ID, nil
+}
+
+// parsePlatform turns the os/arch[/variant] spelling a Compose file uses into
+// the platform descriptor the runtime takes.
+func parsePlatform(value string) (*v1.Platform, error) {
+	parts := strings.Split(value, "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf("platform %q must be written os/arch, such as linux/arm64", value)
+	}
+	platform := &v1.Platform{OS: parts[0], Architecture: parts[1]}
+	if len(parts) == 3 {
+		platform.Variant = parts[2]
+	}
+	return platform, nil
+}
+
+// ulimits converts stored limits into the runtime's form.
+func ulimits(limits []store.Ulimit) []*units.Ulimit {
+	if len(limits) == 0 {
+		return nil
+	}
+	out := make([]*units.Ulimit, 0, len(limits))
+	for _, limit := range limits {
+		out = append(out, &units.Ulimit{Name: limit.Name, Soft: limit.Soft, Hard: limit.Hard})
+	}
+	return out
 }
 
 func buildMounts(req CreateRequest) ([]mount.Mount, error) {
@@ -696,20 +933,105 @@ func (e *Engine) Container(ctx context.Context, id string) (Container, error) {
 	created, _ := time.Parse(time.RFC3339Nano, item.Created)
 	state := ""
 	status := ""
+	exitCode := 0
 	if item.State != nil {
 		state = string(item.State.Status)
 		status = string(item.State.Status)
+		exitCode = item.State.ExitCode
 	}
 	sizeRW := int64(0)
 	if item.SizeRw != nil {
 		sizeRW = *item.SizeRw
 	}
-	return Container{ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: item.Config.Image, ImageID: item.Image, State: state, Status: status, Health: health, Restarts: item.RestartCount, CreatedAt: created, SizeRW: sizeRW, Labels: labels, Managed: labels[LabelManaged] == "true", ProjectID: labels["com.rousoftware.asgard.project-id"], ServiceID: labels["com.rousoftware.asgard.service-id"], ReleaseID: labels["com.rousoftware.asgard.release-id"], Mounts: mounts}, nil
+	return Container{ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: item.Config.Image, ImageID: item.Image, State: state, Status: status, Health: health, Restarts: item.RestartCount, ExitCode: exitCode, CreatedAt: created, SizeRW: sizeRW, Labels: labels, Managed: labels[LabelManaged] == "true", ProjectID: labels["com.rousoftware.asgard.project-id"], ServiceID: labels["com.rousoftware.asgard.service-id"], ReleaseID: labels["com.rousoftware.asgard.release-id"], Mounts: mounts}, nil
 }
 
 const readinessStabilityWindow = 5 * time.Second
 
-func (e *Engine) WaitReady(ctx context.Context, id string, timeout time.Duration, log func(string)) error {
+// Bounds on how long a service may take to become ready.
+const (
+	readinessFloor   = 90 * time.Second
+	readinessCeiling = 15 * time.Minute
+	// readinessSlack covers the wall-clock difference between the healthcheck's
+	// own schedule and the gate that watches it.
+	readinessSlack = 30 * time.Second
+)
+
+// ReadinessSpec says how one service's readiness is judged.
+//
+// Most services run forever, and are ready when the runtime calls them healthy
+// or when they have simply stayed up. A job — Compose's `restart: "no"` plus
+// `depends_on: {condition: service_completed_successfully}` — is the opposite:
+// its exit code is the verdict, and waiting for it is the whole point of the
+// gate, because everything that depends on it must not start until it has
+// finished its work.
+type ReadinessSpec struct {
+	// Job marks a service Asgard waits to finish. A job that is still running
+	// after its budget did not finish, and the release fails with a message
+	// that says so.
+	Job bool
+	// AllowCleanExit marks a service whose exit zero is success rather than an
+	// unexpected death. It is set for a job, and for `restart: on-failure`,
+	// which Docker likewise does not restart after a clean exit.
+	AllowCleanExit bool
+	// Timeout bounds the wait. Zero uses the floor.
+	Timeout time.Duration
+}
+
+// ReadinessFor derives how a service's readiness is judged from what its
+// Compose file declared.
+//
+// A service is treated as a job only when the file says so twice over: it
+// carries `restart: "no"`, which is how Compose marks a one-shot, and it
+// declares no healthcheck, which is how a service says it is meant to keep
+// running and be probed. Either signal alone is ambiguous, and the mistake is
+// expensive in both directions — a job judged as a service starts its
+// dependents before the work is done, and a service judged as a job fails the
+// release after its budget for the crime of still running.
+func ReadinessFor(service store.Service) ReadinessSpec {
+	policy, _ := composecfg.RestartPolicy(service.RestartPolicy)
+	job := policy == "no" && service.Container.Healthcheck == nil
+	return ReadinessSpec{
+		Job:            job,
+		AllowCleanExit: job || policy == "on-failure",
+		Timeout:        ReadinessTimeout(service),
+	}
+}
+
+// ReadinessTimeout derives how long a service may take from the healthcheck its
+// file declared: the start period covers initialization, and the retry budget
+// covers everything after it. A fixed 90 seconds used to fail the release of
+// any service whose own definition of healthy allowed it more time than that —
+// a database initializing a cluster, a CMS running its first migrations —
+// while the file had already said how long to wait.
+func ReadinessTimeout(service store.Service) time.Duration {
+	budget := readinessFloor
+	health := service.Container.Healthcheck
+	if health != nil && len(health.Test) > 0 && health.Test[0] != "NONE" {
+		interval := health.Interval
+		if interval <= 0 {
+			interval = 30 * time.Second
+		}
+		retries := health.Retries
+		if retries <= 0 {
+			retries = 3
+		}
+		budget = health.StartPeriod + time.Duration(retries+1)*interval + readinessSlack
+	}
+	if budget < readinessFloor {
+		return readinessFloor
+	}
+	if budget > readinessCeiling {
+		return readinessCeiling
+	}
+	return budget
+}
+
+func (e *Engine) WaitReady(ctx context.Context, id string, spec ReadinessSpec, log func(string)) error {
+	timeout := spec.Timeout
+	if timeout <= 0 {
+		timeout = readinessFloor
+	}
 	deadline := time.Now().Add(timeout)
 	var stableSince time.Time
 	for time.Now().Before(deadline) {
@@ -717,7 +1039,7 @@ func (e *Engine) WaitReady(ctx context.Context, id string, timeout time.Duration
 		if err != nil {
 			return err
 		}
-		ready, nextStableSince, err := evaluateReadiness(containerInfo, stableSince, time.Now())
+		ready, nextStableSince, err := evaluateReadiness(containerInfo, spec, stableSince, time.Now())
 		if err != nil {
 			return err
 		}
@@ -730,24 +1052,49 @@ func (e *Engine) WaitReady(ctx context.Context, id string, timeout time.Duration
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
-		if containerInfo.Health == "" && !stableSince.IsZero() {
+		switch {
+		case spec.Job:
+			log("Waiting for the one-shot service to finish…")
+		case containerInfo.Health == "" && !stableSince.IsZero():
 			log("Verifying container stability…")
-		} else {
+		default:
 			log("Waiting for container health…")
 		}
 	}
-	return errors.New("container did not become healthy before timeout")
+	if spec.Job {
+		return fmt.Errorf("the one-shot service did not finish within %s; if it is meant to keep running, give it a restart policy other than \"no\" or declare a healthcheck", timeout)
+	}
+	return fmt.Errorf("container did not become healthy within %s", timeout)
 }
 
-func evaluateReadiness(item Container, stableSince, now time.Time) (bool, time.Time, error) {
-	if item.Restarts > 0 {
-		return false, time.Time{}, fmt.Errorf("container restarted %d time(s) before readiness", item.Restarts)
+// evaluateReadiness decides whether a container is ready for the release to
+// move on to its dependents and to its route.
+//
+// A service that runs forever is ready when the runtime says it is healthy, or
+// — for an image that declares no healthcheck — once it has stayed up for a
+// stability window. A job is ready when it exits successfully and failed when
+// it exits any other way, which is the same contract
+// service_completed_successfully expresses in Compose.
+func evaluateReadiness(item Container, spec ReadinessSpec, stableSince, now time.Time) (bool, time.Time, error) {
+	if item.State == "exited" {
+		if item.ExitCode == 0 && spec.AllowCleanExit {
+			return true, time.Time{}, nil
+		}
+		return false, time.Time{}, fmt.Errorf("container exited with status %d", item.ExitCode)
 	}
-	if item.State == "exited" || item.State == "dead" || item.State == "removing" {
+	if item.State == "dead" || item.State == "removing" {
 		return false, time.Time{}, fmt.Errorf("container entered %s state", item.State)
 	}
 	if item.Health == "unhealthy" {
 		return false, time.Time{}, errors.New("container health check failed")
+	}
+	if spec.Job {
+		// The work is not done until the container stops; there is nothing to
+		// consider stable in the meantime.
+		return false, time.Time{}, nil
+	}
+	if item.Restarts > 0 {
+		return false, time.Time{}, fmt.Errorf("container restarted %d time(s) before readiness", item.Restarts)
 	}
 	if item.State != "running" {
 		return false, time.Time{}, nil
@@ -815,7 +1162,12 @@ func (e *Engine) HTTPHealth(ctx context.Context, url string) error {
 		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 400 {
+	// Any answer below 500 proves the port is serving HTTP: a login page that
+	// answers 401, an API that answers 404 at /, or a redirect to /login are
+	// all a live server, and a health gate that fails them fails an application
+	// that is up. A 5xx is the server's own report that it is not ready, and
+	// keeps the gate waiting.
+	if response.StatusCode >= 500 {
 		return fmt.Errorf("health endpoint returned %s", response.Status)
 	}
 	return nil

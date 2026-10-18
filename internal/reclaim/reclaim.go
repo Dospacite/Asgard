@@ -14,12 +14,14 @@ package reclaim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rousoftware/asgard/internal/dockerx"
 	"github.com/rousoftware/asgard/internal/store"
@@ -76,6 +78,41 @@ type Reclaimer struct {
 	Docker *dockerx.Engine
 	Policy Policy
 	Logger *slog.Logger
+
+	// builds is held shared by every image build and exclusively by a pass
+	// that removes anything. A build on the legacy builder keeps its finished
+	// steps as untagged images until the build ends, and a pass removes
+	// untagged images, so the two must never overlap: a pass that ran during a
+	// build deleted a layer the build was about to use and failed it.
+	builds sync.RWMutex
+	// parent is the reclaimer a policy-scoped copy was made from, whose build
+	// gate the copy shares.
+	parent *Reclaimer
+}
+
+// WithPolicy returns a reclaimer that runs under policy instead, without
+// changing the one the sweep and the deployer use, and that still waits out
+// the same builds.
+func (r *Reclaimer) WithPolicy(policy Policy) *Reclaimer {
+	return &Reclaimer{Store: r.Store, Docker: r.Docker, Policy: policy, Logger: r.Logger, parent: r}
+}
+
+func (r *Reclaimer) gate() *sync.RWMutex {
+	if r.parent != nil {
+		return r.parent.gate()
+	}
+	return &r.builds
+}
+
+// ErrBuildInProgress reports a pass skipped because an image build is running.
+var ErrBuildInProgress = errors.New("skipped while an image build is in progress")
+
+// HoldBuilds keeps reclamation from removing anything until the returned
+// release is called. Builds hold it together; only a pass waits for none.
+func (r *Reclaimer) HoldBuilds() (release func()) {
+	gate := r.gate()
+	gate.RLock()
+	return gate.RUnlock
 }
 
 func (r *Reclaimer) logger() *slog.Logger {
@@ -208,6 +245,16 @@ func (r *Reclaimer) inUseImages(ctx context.Context) (map[string]bool, error) {
 // Run performs one reclamation pass.
 func (r *Reclaimer) Run(ctx context.Context) (Result, error) {
 	result := Result{Items: []Item{}, DryRun: r.Policy.DryRun}
+	if !r.Policy.DryRun {
+		// A pass skips rather than waits: the next deployment or sweep will run
+		// it, and waiting would hold a finished release behind another
+		// project's build.
+		gate := r.gate()
+		if !gate.TryLock() {
+			return result, ErrBuildInProgress
+		}
+		defer gate.Unlock()
+	}
 	// Bracket the pass with the daemon's own accounting so the reported figure
 	// is what the disk actually gives back, not the sum of overlapping layers.
 	before, beforeErr := r.Docker.DiskUsage(ctx)

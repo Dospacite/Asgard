@@ -154,7 +154,7 @@ func (i *Importer) FromImage(ctx context.Context, req Request) (store.Project, c
 		compose += fmt.Sprintf("    expose:\n      - %d\n", req.Port)
 	}
 	compose += fmt.Sprintf("x-asgard:\n  primary-service: app\n  services:\n    app:\n      role: web\n      public: %t\n      port: %d\n      health-path: /\n", public, req.Port)
-	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte(compose), 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte(compose), composecfg.SourceFileMode); err != nil {
 		return p, composecfg.ValidationResult{}, err
 	}
 	p.SourceURL = req.Image
@@ -204,7 +204,7 @@ func (i *Importer) finish(ctx context.Context, p *store.Project, root, composePa
 	if err != nil {
 		return composecfg.ValidationResult{}, fmt.Errorf("read Compose file: %w", err)
 	}
-	_, result := composecfg.Parse(data, p.ID, p.Slug, root)
+	_, result := composecfg.Parse(data, p.ID, p.Slug, composecfg.Source{Root: root, Path: clean})
 	if !result.Valid {
 		return result, validationError(result.Errors)
 	}

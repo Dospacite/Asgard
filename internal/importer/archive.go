@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/rousoftware/asgard/internal/composecfg"
 	"github.com/ulikunitz/xz"
 )
 
@@ -214,22 +215,22 @@ func extractTar(reader *tar.Reader, target string) error {
 			return err
 		}
 		if header.Typeflag == tar.TypeDir {
-			if err := os.MkdirAll(abs, 0o750); err != nil {
+			if err := os.MkdirAll(abs, composecfg.SourceDirMode); err != nil {
 				return err
 			}
-			deferredDirs[abs] = 0o750
+			deferredDirs[abs] = composecfg.SourceDirMode
 			continue
 		}
 		expanded += uint64(header.Size)
 		if expanded > MaxArchiveExpanded {
 			return errors.New("archive expands beyond 1 GiB")
 		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(abs), composecfg.SourceDirMode); err != nil {
 			return err
 		}
-		mode := os.FileMode(0o640)
+		mode := composecfg.SourceFileMode
 		if header.FileInfo().Mode().Perm()&0o111 != 0 {
-			mode = 0o750
+			mode = composecfg.SourceExecMode
 		}
 		if err := writeTarFile(abs, reader, header.Size, mode); err != nil {
 			return err

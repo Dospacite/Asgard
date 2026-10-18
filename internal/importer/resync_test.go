@@ -23,7 +23,7 @@ func TestResyncRefusesProjectsWithoutARepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	project := store.Project{ID: "project-1", Slug: "uploaded", Name: "Uploaded", SourceType: "zip", SourcePath: root, ComposePath: "compose.yaml"}
-	_, validation := composecfg.Parse([]byte(compose), project.ID, project.Slug, root)
+	_, validation := composecfg.Parse([]byte(compose), project.ID, project.Slug, composecfg.Source{Root: root, Path: "compose.yaml"})
 	if err := database.CreateProject(context.Background(), project, validation.Services); err != nil {
 		t.Fatal(err)
 	}

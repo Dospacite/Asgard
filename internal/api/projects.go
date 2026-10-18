@@ -247,6 +247,10 @@ func (s *Server) validateCompose(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Content string `json:"content"`
 		Slug    string `json:"slug"`
+		// Path is the Compose file's location inside its project, so a preview
+		// resolves relative paths the way the import will. It defaults to the
+		// project root's compose.yaml.
+		Path string `json:"path"`
 	}
 	if !httpx.Decode(w, r, &body) {
 		return
@@ -255,7 +259,7 @@ func (s *Server) validateCompose(w http.ResponseWriter, r *http.Request) {
 	if slug == "" {
 		slug = "preview"
 	}
-	_, result := composecfg.Parse([]byte(body.Content), uuid.NewString(), slug, "")
+	_, result := composecfg.Parse([]byte(body.Content), uuid.NewString(), slug, composecfg.Source{Path: body.Path})
 	status := http.StatusOK
 	if !result.Valid {
 		status = http.StatusUnprocessableEntity

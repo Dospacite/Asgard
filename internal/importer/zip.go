@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/rousoftware/asgard/internal/composecfg"
 )
 
 const (
@@ -62,19 +64,19 @@ func ExtractZIP(source, target string) error {
 			return fmt.Errorf("ZIP entry %q escapes the project directory", file.Name)
 		}
 		if file.FileInfo().IsDir() {
-			if err := os.MkdirAll(abs, 0o750); err != nil {
+			if err := os.MkdirAll(abs, composecfg.SourceDirMode); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(abs), composecfg.SourceDirMode); err != nil {
 			return err
 		}
 		src, err := file.Open()
 		if err != nil {
 			return err
 		}
-		dst, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		dst, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY, composecfg.SourceFileMode)
 		if err != nil {
 			src.Close()
 			return err

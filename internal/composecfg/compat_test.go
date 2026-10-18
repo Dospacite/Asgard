@@ -49,7 +49,7 @@ func TestParseMergesEnvFileUnderInlineEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if !result.Valid {
 		t.Fatalf("expected valid compose, errors: %+v", result.Errors)
 	}
@@ -77,7 +77,7 @@ func TestParseOptionalEnvFileMayBeMissing(t *testing.T) {
         required: false
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	if _, result := Parse(data, "project", "demo", root); !result.Valid {
+	if _, result := Parse(data, "project", "demo", Source{Root: root}); !result.Valid {
 		t.Fatalf("optional env_file should not fail validation: %+v", result.Errors)
 	}
 }
@@ -89,7 +89,7 @@ func TestParseRequiredEnvFileMustExist(t *testing.T) {
     env_file: .env
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if result.Valid {
 		t.Fatal("a required env_file that is absent must fail validation")
 	}
@@ -106,7 +106,7 @@ func TestParseAcceptsProjectRelativeMount(t *testing.T) {
 `,
 	})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if !result.Valid {
 		t.Fatalf("project-relative mount rejected: %+v", result.Errors)
 	}
@@ -130,7 +130,7 @@ func TestParseRejectsHostAndEscapingMounts(t *testing.T) {
 	} {
 		root := writeProject(t, map[string]string{"compose.yaml": "services:\n  api:\n    image: nginx:1.27\n    volumes:\n      - " + spec + "\n"})
 		data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-		if _, result := Parse(data, "project", "demo", root); result.Valid {
+		if _, result := Parse(data, "project", "demo", Source{Root: root}); result.Valid {
 			t.Fatalf("%s (%q) was accepted", name, spec)
 		}
 	}
@@ -144,7 +144,7 @@ func TestParseRejectsMountOfMissingProjectPath(t *testing.T) {
       - ./nowhere.json:/app/nowhere.json:ro
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if result.Valid {
 		t.Fatal("a mount of a path the project does not ship must fail validation")
 	}
@@ -160,7 +160,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if !result.Valid {
 		t.Fatalf("named volume rejected: %+v", result.Errors)
 	}
@@ -221,7 +221,7 @@ func TestParseInterpolatesFromProjectEnvFile(t *testing.T) {
 `,
 	})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if !result.Valid {
 		t.Fatalf("interpolation failed validation: %+v", result.Errors)
 	}
@@ -251,7 +251,7 @@ func TestParseWarnsAboutUndefinedVariables(t *testing.T) {
       MISSING: ${NOT_DEFINED}
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	_, result := Parse(data, "project", "demo", root)
+	_, result := Parse(data, "project", "demo", Source{Root: root})
 	if !result.Valid {
 		t.Fatalf("an undefined variable must warn, not fail: %+v", result.Errors)
 	}
@@ -274,7 +274,7 @@ func TestParseFailsOnRequiredVariable(t *testing.T) {
       NEEDED: ${MUST_BE_SET:?set this before deploying}
 `})
 	data, _ := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	if _, result := Parse(data, "project", "demo", root); result.Valid {
+	if _, result := Parse(data, "project", "demo", Source{Root: root}); result.Valid {
 		t.Fatal("${VAR:?message} must fail validation when the variable is unset")
 	}
 }

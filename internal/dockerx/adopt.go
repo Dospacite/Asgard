@@ -154,7 +154,7 @@ func (e *Engine) Adopt(ctx context.Context, id string, request AdoptionRequest) 
 	if _, err = e.client.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
 		return fail(err)
 	}
-	if err = e.WaitReady(ctx, created.ID, 60*time.Second, func(string) {}); err != nil {
+	if err = e.WaitReady(ctx, created.ID, ReadinessSpec{Timeout: 60 * time.Second}, func(string) {}); err != nil {
 		return fail(err)
 	}
 	replacement, err := e.Container(ctx, created.ID)

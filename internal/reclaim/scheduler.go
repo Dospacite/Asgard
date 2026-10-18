@@ -2,6 +2,7 @@ package reclaim
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -70,6 +71,10 @@ func (s *Sweeper) Stop() {
 
 func (s *Sweeper) sweep(ctx context.Context) {
 	result, err := s.Reclaimer.Run(ctx)
+	if errors.Is(err, ErrBuildInProgress) {
+		s.Logger.Info("storage reclamation skipped", "reason", err)
+		return
+	}
 	if err != nil {
 		s.Logger.Warn("storage reclamation failed", "error", err)
 		return

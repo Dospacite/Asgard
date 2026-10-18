@@ -18,7 +18,7 @@ x-asgard:
       port: 8080
       health-path: /
 `)
-	_, result := Parse(raw, "project-id", "demo", t.TempDir())
+	_, result := Parse(raw, "project-id", "demo", Source{Root: t.TempDir()})
 	if !result.Valid {
 		t.Fatalf("expected valid: %#v", result.Errors)
 	}
@@ -33,7 +33,7 @@ func TestRejectsPrivilegedAndBind(t *testing.T) {
     privileged: true
     volumes: ["/host:/data"]
 `)
-	_, result := Parse(raw, "project-id", "demo", t.TempDir())
+	_, result := Parse(raw, "project-id", "demo", Source{Root: t.TempDir()})
 	if result.Valid {
 		t.Fatal("unsafe compose accepted")
 	}

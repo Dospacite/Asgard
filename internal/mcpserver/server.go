@@ -264,7 +264,11 @@ func (s *Server) addTools() {
 		if err := require(ctx, "asgard:read"); err != nil {
 			return nil, nil, err
 		}
-		items, err := s.Store.ListDeployments(ctx, in.ProjectID, 100)
+		project, err := s.Store.GetProject(ctx, in.ProjectID)
+		if err != nil {
+			return nil, nil, err
+		}
+		items, err := s.Store.ListDeployments(ctx, project.ID, 100)
 		return nil, map[string]any{"items": items}, err
 	})
 	mcp.AddTool(s.MCP, readTool("operation_get", "Get operation", "Get durable operation state and progress."), func(ctx context.Context, _ *mcp.CallToolRequest, in IDInput) (*mcp.CallToolResult, any, error) {
@@ -743,7 +747,7 @@ func (s *Server) reclaimStorage(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 	// Scoped so an agent's override cannot change the policy the scheduled
 	// sweep and the deployer run under.
-	scoped := &reclaim.Reclaimer{Store: s.Store, Docker: s.Docker, Policy: policy}
+	scoped := s.Reclaimer.WithPolicy(policy)
 	result, err := scoped.Run(ctx)
 	if err != nil {
 		return nil, nil, err

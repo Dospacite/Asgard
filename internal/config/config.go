@@ -85,7 +85,7 @@ func Load() (Config, error) {
 	if err != nil || keepImages < 1 || keepImages > 50 {
 		return Config{}, errors.New("ASGARD_KEEP_RELEASE_IMAGES must be between 1 and 50")
 	}
-	cacheGB, err := envInt("ASGARD_BUILD_CACHE_GB", 2)
+	cacheGB, err := envInt("ASGARD_BUILD_CACHE_GB", 10)
 	if err != nil || cacheGB < 0 || cacheGB > 500 {
 		return Config{}, errors.New("ASGARD_BUILD_CACHE_GB must be between 0 and 500")
 	}

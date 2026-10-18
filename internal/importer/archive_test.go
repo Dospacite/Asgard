@@ -113,3 +113,44 @@ func TestHasArchiveExtension(t *testing.T) {
 		}
 	}
 }
+
+// A workload may run as a non-root user — `user: "1000:1000"` with a
+// project-relative config mount is an ordinary hardened Compose file — so the
+// files it mounts have to be readable by that user. Extraction used to apply
+// private modes (0600/0750), which made exactly that shape fail at run time
+// with a permission error inside the application.
+func TestExtractedSourceIsReadableByANonRootWorkload(t *testing.T) {
+	archive := writeTarGz(t,
+		[]tar.Header{
+			{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o700},
+			{Name: "app/compose.yaml", Typeflag: tar.TypeReg, Mode: 0o600},
+			{Name: "app/entrypoint.sh", Typeflag: tar.TypeReg, Mode: 0o700},
+		},
+		map[string]string{"app/compose.yaml": "services: {}\n", "app/entrypoint.sh": "#!/bin/sh\n"},
+	)
+	target := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractArchive(archive, target, "archive.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := flattenSingleRoot(target); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]os.FileMode{
+		"compose.yaml":  0o644,
+		"entrypoint.sh": 0o755,
+	} {
+		info, err := os.Stat(filepath.Join(target, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Fatalf("%s extracted with mode %o, want %o", path, got, want)
+		}
+		if got := info.Mode().Perm() & 0o044; got != 0o044 {
+			t.Fatalf("%s is not readable by group and other: %o", path, info.Mode().Perm())
+		}
+	}
+}

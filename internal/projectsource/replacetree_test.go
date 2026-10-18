@@ -100,8 +100,11 @@ func TestReplaceTreeLeavesLiveTreeAloneWhenIncomingIsUnusable(t *testing.T) {
 	project, database := createProject(t, original)
 	incomingRoot := t.TempDir()
 
+	// "invalid" is a file Asgard refuses — here a privileged service — and
+	// "removal" is a valid file that would drop a service the project already
+	// runs. Neither may reach the live tree.
 	for name, incoming := range map[string]string{
-		"invalid": "services:\n  app:\n    image: nginx:1.27\n    networks: [default]\n",
+		"invalid": "services:\n  app:\n    image: nginx:1.27\n    privileged: true\n",
 		"removal": "services:\n  replacement:\n    image: nginx:1.27\n",
 	} {
 		t.Run(name, func(t *testing.T) {

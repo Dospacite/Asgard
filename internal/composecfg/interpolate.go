@@ -20,19 +20,37 @@ var variablePattern = regexp.MustCompile(`\$(\$|[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z
 // the project's own .env file is consulted: the control plane's process
 // environment belongs to Asgard, not to the workload, so leaking it into an
 // imported Compose file would be both surprising and unsafe.
-func interpolationValues(root string) map[string]string {
-	if root == "" {
+//
+// Compose reads the .env beside the Compose file — `deploy/compose.yaml` is
+// interpolated from `deploy/.env` — and the project's own editor treats that
+// same file as the editable environment, so the two agree. The repository
+// root's .env is still read when the Compose file sits in the root or when the
+// beside-the-file one is absent, which is what every project laid out that way
+// expects.
+func interpolationValues(source Source) map[string]string {
+	if source.Root == "" {
 		return nil
 	}
-	data, err := os.ReadFile(filepath.Join(root, ".env"))
-	if err != nil {
-		return nil
+	for _, candidate := range dotEnvCandidates(source) {
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if values, err := ParseEnvFile(data); err == nil {
+			return values
+		}
 	}
-	values, err := ParseEnvFile(data)
-	if err != nil {
-		return nil
+	return nil
+}
+
+// dotEnvCandidates lists the .env files Compose would interpolate from, most
+// specific first.
+func dotEnvCandidates(source Source) []string {
+	candidates := []string{filepath.Join(source.AbsoluteDir(), ".env")}
+	if source.Directory() != "" {
+		candidates = append(candidates, filepath.Join(source.Root, ".env"))
 	}
-	return values
+	return dedupe(candidates)
 }
 
 // interpolateNode substitutes variables in every scalar of a decoded YAML tree.

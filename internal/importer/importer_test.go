@@ -10,14 +10,17 @@ import (
 	"github.com/rousoftware/asgard/internal/store"
 )
 
+// A validation failure has to name the path it rejected and why, because that
+// text is what an operator — or an importing agent — acts on. The reasons live
+// in the contract rather than in the transport, so this checks that both the
+// path and the refusal survive into the error.
 func TestFinishReportsComposeValidationDetails(t *testing.T) {
 	root := t.TempDir()
-	compose := `x-flags:
-  FEATURE: enabled
-services:
+	compose := `services:
   web:
     image: nginx:1.27
-    networks: [default]
+    privileged: true
+    imagee: nginx:1.27
 `
 	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte(compose), 0o600); err != nil {
 		t.Fatal(err)
@@ -32,11 +35,14 @@ services:
 		t.Fatal("invalid Compose file reported as valid")
 	}
 	for _, want := range []string{
-		"compose.x-flags: This field is not supported by Asgard's safe Compose contract.",
-		"services.web.networks: This field is not supported by Asgard's safe Compose contract.",
+		"services.web.privileged:",
+		"services.web.imagee:",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
+	}
+	if !strings.Contains(err.Error(), "refused") && !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("error %q carries no reason", err)
 	}
 }

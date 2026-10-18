@@ -20,12 +20,50 @@ uploaded archive (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`),
 or a public OCI image. Every deployment produces a numbered release with a
 Compose snapshot, so a rollback is a real thing you can point at.
 
-**A constrained Compose contract.** Asgard accepts a safe subset of Compose:
-build, command, environment, `env_file`, volumes, dependencies, health checks,
-restart policies, and CPU/memory/PID limits, plus an `x-asgard` block for
-routing. Privileged mode, host networking, devices, Docker socket mounts, and
-host bind mounts outside the project are rejected. Named volumes and
-project-relative paths are allowed.
+**A Compose contract that tells the truth.** Asgard applies the fields it can
+honor and *says so* about the ones it cannot. Image, build, command, entrypoint,
+environment, `env_file`, volumes, labels, `user`, `working_dir`, `read_only`,
+`tmpfs`, `sysctls`, `ulimits`, `shm_size`, `stop_grace_period`, `stop_signal`,
+`platform`, dependencies, health checks, restart policies, and CPU/memory/PID
+limits — in either the `deploy.resources.limits` or the `mem_limit`/`cpus`
+spelling — all reach the container. `container_name`, `profiles`, `logging`,
+`init`, `tty`, `dns`, `links` and the other keys with no Asgard equivalent are
+accepted with a warning that names them, so an ordinary project imports
+unchanged instead of having to be forked into an Asgard-only Compose file.
+`x-*` extension keys and YAML anchors with `<<:` merge keys are legal
+everywhere, and relative paths — build context, `env_file`, project-relative
+mounts, and the project's `.env` — resolve against the Compose file's
+directory, exactly as Compose resolves them.
+
+Builds run on the host daemon's BuildKit under a client build session, the way
+`docker build` runs them, so earlier build stages stay cached between releases,
+`RUN --mount=type=cache` works, and a `# syntax=` frontend resolves. Base images
+are pulled anonymously. A daemon without BuildKit gets the same build on the
+legacy builder, which caches only the final stage. An image build and a storage
+reclamation pass never overlap; a scheduled pass that finds a build running is
+skipped until the next deployment or sweep.
+`build.target` selects a stage, and `build.args` reach the builder. A string
+`command` or `entrypoint` is split into an argv the way Compose splits it, not
+handed to a shell, so the flags-as-a-string idiom reaches the image's entrypoint
+intact.
+
+File-backed Compose `secrets` and `configs` are served where Compose mounts them
+— `/run/secrets/<name>` and `/<name>` — from the project's own source, so
+`secrets: {db-password: {file: ./db/password.txt}}` works; a secret that lives in
+the host's store, or in the environment that ran the container, is refused by
+name.
+
+`network_mode: bridge`, `security_opt: [no-new-privileges]`, and `cap_drop: [ALL]`
+name the platform's own defaults and are accepted with a note.
+
+Privileged mode, host networking, devices, capability additions, `extra_hosts`,
+Docker socket mounts, and host bind mounts outside the project are still
+rejected, each with the reason. Named volumes and
+project-relative paths are allowed; a data directory the project does not ship,
+such as `./data:/data`, is created in the project's own source tree. `./data`
+counts as a directory; a missing *file* — `./secrets/key.json` — is still an
+error, because mounting an empty directory over it would fail later and less
+clearly.
 
 **Routing and TLS.** Traefik fronts every workload. A service marked public gets
 a router, a health check, and an automatic Let's Encrypt certificate for its
@@ -122,7 +160,7 @@ Edit `deploy/.env`:
 | `ASGARD_SECURE_COOKIES` | Leave `true` for any real deployment |
 | `ASGARD_CREDENTIAL_VERIFY_HOURS` | How often stored Git credentials are re-proven (default `6`, `0` disables) |
 | `ASGARD_KEEP_RELEASE_IMAGES` | Releases whose images are kept — also how far back a rollback can reach (default `3`) |
-| `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `2`, `0` disables cache pruning) |
+| `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `10`, `0` disables cache pruning) |
 | `ASGARD_RECLAIM_HOURS` | How often disk is reclaimed (default `12`, `0` disables) |
 | `ASGARD_GRAFANA_HOSTNAME` | Hostname of the log collector's UI, e.g. `grafana.apps.example.com` |
 | `ASGARD_GRAFANA_ADMIN_PASSWORD` | Grafana's admin password; also the only credential the collector exposes |
@@ -203,6 +241,37 @@ docker compose -f deploy/compose.yaml config -q
 3. **Deploy.** The release builds, starts, waits for the health check, and only
    then moves traffic. If the health gate fails, the previous release keeps
    serving.
+
+### What the release gate waits for
+
+A release is ordered by `depends_on`, and every service has to become ready
+before the services that depend on it are created — or before the release is
+declared live.
+
+- **A healthcheck the Compose file declares is applied to the container**, so
+  the file's own definition of healthy is the one the gate uses. Its
+  `start_period` and `retries × interval` also set how long the release will
+  wait before giving up, instead of a fixed ninety seconds that failed slow
+  databases and first-boot migrations.
+- **A service with `restart: "no"` is a job**, and its exit code is the verdict:
+  exiting zero means the work it was there to do is done, which is exactly what
+  `depends_on: {condition: service_completed_successfully}` waits for, and any
+  other exit fails the release with the job's logs. A job that never finishes is
+  reported as such. A service that declares a healthcheck is never treated as a
+  job — it is asking to be probed.
+- **A service with no healthcheck** is ready once it has stayed up for five
+  seconds.
+- **A public service** must also answer HTTP at its health path: any status
+  below 500 counts, because a login page answering 401 or an API answering 404
+  at `/` is a live server. A 5xx keeps the gate waiting.
+
+**Unchanged services keep running.** When a release would create exactly the
+container a service already runs — same image, same configuration — and that
+container is up and not unhealthy, it carries over into the new release instead
+of being recreated, the way `docker compose up` leaves an unchanged service
+alone. A one-shot job always runs again, and a service that mounts files from
+the project source is always recreated, because a re-sync replaces the source
+tree a running container would still be holding.
 
 ### Git projects and the source snapshot
 

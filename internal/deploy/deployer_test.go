@@ -25,3 +25,23 @@ func TestStopPriorBeforeCandidate(t *testing.T) {
 		})
 	}
 }
+
+func TestKeepable(t *testing.T) {
+	tests := []struct {
+		name string
+		svc  store.Service
+		want bool
+	}{
+		{name: "long-running service", svc: store.Service{RestartPolicy: "unless-stopped", Volumes: []string{"asgard-demo-data:/var/lib/data"}}, want: true},
+		{name: "one-shot job", svc: store.Service{RestartPolicy: "no"}, want: false},
+		{name: "job-shaped but probed", svc: store.Service{RestartPolicy: "no", Container: store.ContainerConfig{Healthcheck: &store.Healthcheck{Test: []string{"CMD", "true"}}}}, want: true},
+		{name: "mounts project source", svc: store.Service{RestartPolicy: "always", Volumes: []string{"@project/Caddyfile:/etc/caddy/Caddyfile:ro"}}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := keepable(tt.svc); got != tt.want {
+				t.Fatalf("keepable() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
