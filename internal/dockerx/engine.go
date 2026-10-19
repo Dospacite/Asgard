@@ -512,7 +512,9 @@ func (e *Engine) Pull(ctx context.Context, image string, log func(string)) error
 	return scanner.Err()
 }
 
-func (e *Engine) Build(ctx context.Context, contextDir, dockerfile, tag, target string, buildArgs map[string]string, log func(string)) error {
+// Build builds one image and gives it every tag in tags. Services that share a
+// build are built once and tagged for each of them.
+func (e *Engine) Build(ctx context.Context, contextDir, dockerfile string, tags []string, target string, buildArgs map[string]string, log func(string)) error {
 	args := map[string]*string{}
 	for key, value := range buildArgs {
 		arguments := value
@@ -525,7 +527,7 @@ func (e *Engine) Build(ctx context.Context, contextDir, dockerfile, tag, target 
 	// stages from nothing. BuildKit keeps that cache in the build cache, bounded
 	// by its own budget, and also skips stages the target does not need, runs
 	// independent stages in parallel, and supports `RUN --mount=type=cache`.
-	options := client.ImageBuildOptions{Tags: []string{tag}, Dockerfile: filepath.ToSlash(dockerfile), Target: target, BuildArgs: args, PullParent: true, Labels: map[string]string{LabelManaged: "true"}, Version: build.BuilderBuildKit}
+	options := client.ImageBuildOptions{Tags: tags, Dockerfile: filepath.ToSlash(dockerfile), Target: target, BuildArgs: args, PullParent: true, Labels: map[string]string{LabelManaged: "true"}, Version: build.BuilderBuildKit}
 	err := e.buildKit(ctx, contextDir, options, log)
 	if err == nil || !needsLegacyBuilder(err.Error()) {
 		return err
@@ -580,7 +582,10 @@ func needsLegacyBuilder(message string) bool {
 // buildWith streams one build and returns the builder's own error.
 func (e *Engine) buildWith(ctx context.Context, contextDir string, options client.ImageBuildOptions, log func(string)) error {
 	reader, writer := io.Pipe()
-	go func() { err := writeBuildContext(writer, contextDir); _ = writer.CloseWithError(err) }()
+	go func() {
+		err := writeBuildContext(writer, contextDir, options.Dockerfile)
+		_ = writer.CloseWithError(err)
+	}()
 	result, err := e.client.ImageBuild(ctx, reader, options)
 	if err != nil {
 		return err
@@ -624,10 +629,19 @@ func (e *Engine) buildWith(ctx context.Context, contextDir string, options clien
 	return buildErr
 }
 
-func writeBuildContext(writer io.Writer, root string) error {
+// writeBuildContext streams the build context as a tar archive, leaving out
+// what the project's .dockerignore excludes, as `docker build` would. Sending
+// less is faster, and it keeps an excluded file that changes — a README, a
+// local .env, test fixtures — from invalidating a `COPY . .` layer and every
+// step after it.
+func writeBuildContext(writer io.Writer, root, dockerfile string) error {
 	archive := tar.NewWriter(writer)
 	defer archive.Close()
 	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	ignore, err := loadDockerignore(rootAbs, dockerfile)
 	if err != nil {
 		return err
 	}
@@ -645,6 +659,12 @@ func writeBuildContext(writer io.Writer, root string) error {
 		}
 		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "node_modules" || entry.Name() == "data") {
 			return filepath.SkipDir
+		}
+		if ignore.excludes(filepath.ToSlash(rel), entry.IsDir()) {
+			if entry.IsDir() && !ignore.hasExceptions {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {

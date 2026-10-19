@@ -33,7 +33,10 @@ type Deployer struct {
 	// behind. A deployment is what creates them, so it is the natural place to
 	// collect the ones that just aged out of the retention window.
 	Reclaimer *reclaim.Reclaimer
-	locks     sync.Map
+	// BuildConcurrency caps how many of a release's images build at once.
+	// Values below one build them one at a time.
+	BuildConcurrency int
+	locks            sync.Map
 }
 type Payload struct {
 	Trigger           string `json:"trigger"`
@@ -157,6 +160,24 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 			}
 		}
 	}
+	// Every image is built before any running container is touched, so a
+	// failed build leaves the live release exactly as it was. Independent
+	// images build side by side instead of each waiting for the previous
+	// service to be built, started and found healthy.
+	builtRefs := map[string]string{}
+	if payload.RollbackReleaseID == "" {
+		plan, refs := planBuilds(project.SourcePath, project.Slug, release.Version, ordered)
+		if len(plan) > 0 {
+			progress(10, fmt.Sprintf("Building %d image(s) for %d service(s)", len(plan), len(refs)))
+			unhold := d.holdBuilds()
+			err = runBuilds(ctx, plan, d.BuildConcurrency, d.Docker.Build, log)
+			unhold()
+			if err != nil {
+				return err
+			}
+		}
+		builtRefs = refs
+	}
 	old, err := d.Store.ActiveRuntimes(ctx, project.ID)
 	if err != nil {
 		return err
@@ -195,17 +216,10 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 			return ctx.Err()
 		default:
 		}
-		progress(10+(index*55/len(ordered)), fmt.Sprintf("Preparing %s", svc.Name))
+		progress(30+(index*35/len(ordered)), fmt.Sprintf("Preparing %s", svc.Name))
 		imageRef := svc.Image
-		if payload.RollbackReleaseID == "" && svc.BuildContext != "" {
-			imageRef = fmt.Sprintf("asgard/%s/%s:r%d", project.Slug, svc.Name, release.Version)
-			contextDir := filepath.Join(project.SourcePath, svc.BuildContext)
-			release := d.holdBuilds()
-			err = d.Docker.Build(ctx, contextDir, svc.Dockerfile, imageRef, svc.Container.BuildTarget, svc.Container.BuildArgs, log)
-			release()
-			if err != nil {
-				return fmt.Errorf("build %s: %w", svc.Name, err)
-			}
+		if built, ok := builtRefs[svc.ID]; ok {
+			imageRef = built
 		} else {
 			normalized, normErr := dockerx.NormalizeImage(imageRef)
 			if normErr != nil {

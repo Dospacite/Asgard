@@ -63,7 +63,7 @@ func New(cfg config.Config) (*App, error) {
 	}
 	proxyGenerator := &proxy.Generator{Store: database, Dir: cfg.TraefikDynamicDir, Domain: cfg.Domain}
 	ops := operations.New(database, cfg.OperationWorkers)
-	deployer := &deploy.Deployer{Store: database, Docker: engine, Proxy: proxyGenerator, EdgeNetwork: cfg.EdgeNetwork, DataDir: cfg.DataDir, DataVolume: cfg.DataVolume}
+	deployer := &deploy.Deployer{Store: database, Docker: engine, Proxy: proxyGenerator, EdgeNetwork: cfg.EdgeNetwork, DataDir: cfg.DataDir, DataVolume: cfg.DataVolume, BuildConcurrency: cfg.BuildConcurrency}
 	ops.Register("deployment.create", deployer.Handle)
 	ops.Register("deployment.rollback", deployer.Handle)
 	backupManager := &backup.Manager{Store: database, Docker: engine, BackupsDir: cfg.BackupsDir, DataVolume: cfg.DataVolume, HelperImage: cfg.HelperImage}

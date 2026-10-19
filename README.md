@@ -42,6 +42,10 @@ are pulled anonymously. A daemon without BuildKit gets the same build on the
 legacy builder, which caches only the final stage. An image build and a storage
 reclamation pass never overlap; a scheduled pass that finds a build running is
 skipped until the next deployment or sweep.
+A release builds all of its images before it touches any running container,
+up to `ASGARD_BUILD_CONCURRENCY` at a time, and services with the same context,
+Dockerfile, target and build args share one build. The build context honors
+`.dockerignore`, or a `<Dockerfile>.dockerignore` beside the Dockerfile.
 `build.target` selects a stage, and `build.args` reach the builder. A string
 `command` or `entrypoint` is split into an argv the way Compose splits it, not
 handed to a shell, so the flags-as-a-string idiom reaches the image's entrypoint
@@ -161,6 +165,7 @@ Edit `deploy/.env`:
 | `ASGARD_CREDENTIAL_VERIFY_HOURS` | How often stored Git credentials are re-proven (default `6`, `0` disables) |
 | `ASGARD_KEEP_RELEASE_IMAGES` | Releases whose images are kept — also how far back a rollback can reach (default `3`) |
 | `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `10`, `0` disables cache pruning) |
+| `ASGARD_BUILD_CONCURRENCY` | How many of a release's images build at once (default `2`) |
 | `ASGARD_RECLAIM_HOURS` | How often disk is reclaimed (default `12`, `0` disables) |
 | `ASGARD_GRAFANA_HOSTNAME` | Hostname of the log collector's UI, e.g. `grafana.apps.example.com` |
 | `ASGARD_GRAFANA_ADMIN_PASSWORD` | Grafana's admin password; also the only credential the collector exposes |
