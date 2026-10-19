@@ -19,12 +19,18 @@ var ErrNotGitSource = errors.New("only projects imported from Git can be re-sync
 
 // ResyncResult reports what a completed re-sync fetched and what it kept.
 type ResyncResult struct {
-	Project         store.Project               `json:"project"`
-	Validation      composecfg.ValidationResult `json:"validation"`
-	Commit          string                      `json:"commit"`
-	Ref             string                      `json:"ref"`
-	Changed         bool                        `json:"changed"`
-	PreservedDotEnv bool                        `json:"preservedDotEnv"`
+	Project    store.Project               `json:"project"`
+	Validation composecfg.ValidationResult `json:"validation"`
+	Commit     string                      `json:"commit"`
+	Ref        string                      `json:"ref"`
+	// Changed reports whether the commit moved. ServicesChanged reports
+	// whether any stored service configuration did, which is what decides
+	// whether a deployment will recreate anything.
+	Changed         bool                          `json:"changed"`
+	ServicesChanged bool                          `json:"servicesChanged"`
+	Reconcile       projectsource.ReconcileReport `json:"reconcile"`
+	Summary         string                        `json:"summary"`
+	PreservedDotEnv bool                          `json:"preservedDotEnv"`
 }
 
 // IsGitSource reports whether a project's source type came from a repository.
@@ -121,7 +127,7 @@ func (i *Importer) Resync(ctx context.Context, projectID string) (ResyncResult, 
 		swapped = true
 		return nil
 	}
-	validation, err := projectsource.ReplaceTree(ctx, i.Store, project, i.Domain, string(current), string(incoming), staging, swap)
+	validation, report, err := projectsource.ReplaceTree(ctx, i.Store, project, i.Domain, string(current), string(incoming), staging, swap)
 	if err != nil {
 		return ResyncResult{Validation: validation}, err
 	}
@@ -146,6 +152,9 @@ func (i *Importer) Resync(ctx context.Context, projectID string) (ResyncResult, 
 		// A project imported before commits were recorded has nothing to compare
 		// against, so the honest answer there is that the tree may have moved.
 		Changed:         project.SourceCommit == "" || project.SourceCommit != commit,
+		ServicesChanged: report.Changed(),
+		Reconcile:       report,
+		Summary:         report.Summary(),
 		PreservedDotEnv: preserved,
 	}, nil
 }

@@ -12,9 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -27,8 +25,6 @@ const (
 	MaxDotEnvBytes     = 256 << 10
 	maxSourceFiles     = 64
 )
-
-var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type File struct {
 	Path       string                       `json:"path"`
@@ -135,9 +131,12 @@ func Save(ctx context.Context, database *store.Store, project store.Project, dom
 		}
 	}
 
-	if spec.Kind == "compose" {
+	switch spec.Kind {
+	case "compose":
 		err = saveCompose(ctx, database, project, spec, current, content, previous, incoming)
-	} else {
+	case "dotenv":
+		err = saveDotEnv(ctx, database, project, domain, spec, current, content)
+	default:
 		err = writeAtomic(project.SourcePath, spec, current, content, func() error {
 			_, updateErr := database.DB.ExecContext(ctx, `UPDATE projects SET updated_at=? WHERE id=?`, store.Now(), project.ID)
 			return updateErr
@@ -162,55 +161,19 @@ func Save(ctx context.Context, database *store.Store, project store.Project, dom
 // and a database failure after it leaves both to be rolled back together.
 // incomingRoot is where the new tree is staged; env files and project-relative
 // mounts have to resolve against it rather than the tree being replaced.
-func ReplaceTree(ctx context.Context, database *store.Store, project store.Project, domain, previousCompose, incomingCompose, incomingRoot string, swap func() error) (composecfg.ValidationResult, error) {
+func ReplaceTree(ctx context.Context, database *store.Store, project store.Project, domain, previousCompose, incomingCompose, incomingRoot string, swap func() error) (composecfg.ValidationResult, ReconcileReport, error) {
 	_, incoming := composecfg.Parse([]byte(incomingCompose), project.ID, project.Slug, composecfg.Source{Root: incomingRoot, Path: project.ComposePath})
 	adaptDomain(&incoming, domain)
 	if !incoming.Valid {
-		return incoming, &Problem{Code: "compose_invalid", Message: "The re-synced Compose file is not valid for this platform. The running project was left untouched.", Validation: &incoming}
+		return incoming, ReconcileReport{}, &Problem{Code: "compose_invalid", Message: "The re-synced Compose file is not valid for this platform. The running project was left untouched.", Validation: &incoming}
 	}
 	_, previous := composecfg.Parse([]byte(previousCompose), project.ID, project.Slug, composecfg.Source{Root: project.SourcePath, Path: project.ComposePath})
 	adaptDomain(&previous, domain)
 	if err := rejectServiceRemoval(project.Services, incoming.Services, &incoming); err != nil {
-		return incoming, err
+		return incoming, ReconcileReport{}, err
 	}
-
-	tx, err := database.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return incoming, err
-	}
-	defer tx.Rollback()
-	previousByName := map[string]store.Service{}
-	if previous.Valid {
-		for _, service := range previous.Services {
-			previousByName[service.Name] = service
-		}
-	}
-	currentByName := map[string]store.Service{}
-	for _, service := range project.Services {
-		currentByName[service.Name] = service
-	}
-	for _, parsed := range incoming.Services {
-		currentService, exists := currentByName[parsed.Name]
-		if !exists {
-			parsed.ID = uuid.NewString()
-			parsed.ProjectID = project.ID
-			if err := insertService(ctx, tx, parsed); err != nil {
-				return incoming, err
-			}
-			continue
-		}
-		merged := mergeService(currentService, previousByName[parsed.Name], parsed, previous.Valid)
-		if err := updateComposedService(ctx, tx, merged, currentService.ConfigRevision); err != nil {
-			return incoming, err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE projects SET primary_service=?,updated_at=? WHERE id=?`, incoming.PrimaryService, store.Now(), project.ID); err != nil {
-		return incoming, err
-	}
-	if err := swap(); err != nil {
-		return incoming, err
-	}
-	return incoming, tx.Commit()
+	report, err := applyServices(ctx, database, project, previous, incoming, swap)
+	return incoming, report, err
 }
 
 func ParseDotEnv(content string) (map[string]string, []composecfg.ValidationError) {
@@ -221,26 +184,14 @@ func ParseDotEnv(content string) (map[string]string, []composecfg.ValidationErro
 	lineNumber := 0
 	for scanner.Scan() {
 		lineNumber++
-		line := strings.TrimSpace(strings.TrimSuffix(scanner.Text(), "\r"))
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
-		}
-		key, raw, ok := strings.Cut(line, "=")
-		key = strings.TrimSpace(key)
-		path := fmt.Sprintf(".env.%d", lineNumber)
-		if !ok || !environmentNamePattern.MatchString(key) {
-			issues = append(issues, composecfg.ValidationError{Path: path, Message: "Use NAME=value with a variable name containing letters, numbers, and underscores."})
-			continue
-		}
-		value, err := parseDotEnvValue(strings.TrimSpace(raw))
+		key, value, ok, err := composecfg.ParseEnvLine(scanner.Text())
 		if err != nil {
-			issues = append(issues, composecfg.ValidationError{Path: path, Message: err.Error()})
+			issues = append(issues, composecfg.ValidationError{Path: fmt.Sprintf(".env.%d", lineNumber), Message: sentence(err.Error())})
 			continue
 		}
-		values[key] = value
+		if ok {
+			values[key] = value
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		issues = append(issues, composecfg.ValidationError{Path: ".env", Message: err.Error()})
@@ -248,59 +199,12 @@ func ParseDotEnv(content string) (map[string]string, []composecfg.ValidationErro
 	return values, issues
 }
 
-func parseDotEnvValue(raw string) (string, error) {
-	if raw == "" {
-		return "", nil
+// sentence capitalizes a parser message for display beside the editor.
+func sentence(message string) string {
+	if message == "" {
+		return message
 	}
-	if raw[0] == '\'' {
-		end := strings.Index(raw[1:], "'")
-		if end < 0 {
-			return "", errors.New("Single-quoted value is missing its closing quote.")
-		}
-		end++
-		if trailing := strings.TrimSpace(raw[end+1:]); trailing != "" && !strings.HasPrefix(trailing, "#") {
-			return "", errors.New("Unexpected text after the quoted value.")
-		}
-		return raw[1:end], nil
-	}
-	if raw[0] == '"' {
-		end := closingDoubleQuote(raw)
-		if end < 0 {
-			return "", errors.New("Double-quoted value is missing its closing quote.")
-		}
-		if trailing := strings.TrimSpace(raw[end+1:]); trailing != "" && !strings.HasPrefix(trailing, "#") {
-			return "", errors.New("Unexpected text after the quoted value.")
-		}
-		value, err := strconv.Unquote(raw[:end+1])
-		if err != nil {
-			return "", errors.New("Double-quoted value contains an invalid escape sequence.")
-		}
-		return value, nil
-	}
-	for index, r := range raw {
-		if r == '#' && index > 0 && (raw[index-1] == ' ' || raw[index-1] == '\t') {
-			return strings.TrimSpace(raw[:index]), nil
-		}
-	}
-	return strings.TrimSpace(raw), nil
-}
-
-func closingDoubleQuote(raw string) int {
-	escaped := false
-	for index := 1; index < len(raw); index++ {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if raw[index] == '\\' {
-			escaped = true
-			continue
-		}
-		if raw[index] == '"' {
-			return index
-		}
-	}
-	return -1
+	return strings.ToUpper(message[:1]) + message[1:] + "."
 }
 
 func allowedFiles(project store.Project) ([]fileSpec, error) {
@@ -479,10 +383,73 @@ func adaptDomain(result *composecfg.ValidationResult, domain string) {
 	}
 }
 
-func saveCompose(ctx context.Context, database *store.Store, project store.Project, spec fileSpec, current File, content string, previous, incoming composecfg.ValidationResult) error {
-	tx, err := database.DB.BeginTx(ctx, nil)
+// saveDotEnv writes the project's .env and applies what it changes. Services
+// read it through env_file and interpolation, so an edit that stopped at the
+// file would only show up in a preview, never in a container.
+func saveDotEnv(ctx context.Context, database *store.Store, project store.Project, domain string, spec fileSpec, current File, content string) error {
+	compose, readErr := os.ReadFile(filepath.Join(project.SourcePath, project.ComposePath))
+	source := composecfg.Source{Root: project.SourcePath, Path: project.ComposePath}
+	var previous composecfg.ValidationResult
+	if readErr == nil {
+		_, previous = composecfg.Parse(compose, project.ID, project.Slug, source)
+		adaptDomain(&previous, domain)
+	}
+	rollback, err := replaceFile(project.SourcePath, spec, current, content)
 	if err != nil {
 		return err
+	}
+	if readErr != nil || !previous.Valid {
+		// Nothing to reconcile against: the project has no Compose file, or the
+		// file is already invalid for reasons the .env cannot be blamed for.
+		if _, err := database.DB.ExecContext(ctx, `UPDATE projects SET updated_at=? WHERE id=?`, store.Now(), project.ID); err != nil {
+			_ = rollback.rollback()
+			return err
+		}
+		return rollback.commit()
+	}
+	_, incoming := composecfg.Parse(compose, project.ID, project.Slug, source)
+	adaptDomain(&incoming, domain)
+	if !incoming.Valid {
+		_ = rollback.rollback()
+		return &Problem{Code: "compose_invalid", Message: "With this .env the Compose file is no longer valid. Fix the listed issues before saving.", Validation: &incoming}
+	}
+	if _, err := applyServices(ctx, database, project, previous, incoming, func() error { return nil }); err != nil {
+		_ = rollback.rollback()
+		return err
+	}
+	return rollback.commit()
+}
+
+func saveCompose(ctx context.Context, database *store.Store, project store.Project, spec fileSpec, current File, content string, previous, incoming composecfg.ValidationResult) error {
+	var rollback fileRollback
+	installed := false
+	_, err := applyServices(ctx, database, project, previous, incoming, func() error {
+		var replaceErr error
+		rollback, replaceErr = replaceFile(project.SourcePath, spec, current, content)
+		installed = replaceErr == nil
+		return replaceErr
+	})
+	if err != nil {
+		if installed {
+			_ = rollback.rollback()
+		}
+		return err
+	}
+	return rollback.commit()
+}
+
+// applyServices writes the services a Compose file now produces, merged with
+// what is stored, in one transaction. install puts the new source on disk; it
+// runs after every row is staged and before the commit, and must undo itself
+// when the commit fails, which applyServices reports by returning the error.
+func applyServices(ctx context.Context, database *store.Store, project store.Project, previous, incoming composecfg.ValidationResult, install func() error) (ReconcileReport, error) {
+	baselines, err := database.ComposedBaselines(ctx, project.ID)
+	if err != nil {
+		return ReconcileReport{}, err
+	}
+	tx, err := database.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return ReconcileReport{}, err
 	}
 	defer tx.Rollback()
 	previousByName := map[string]store.Service{}
@@ -495,33 +462,43 @@ func saveCompose(ctx context.Context, database *store.Store, project store.Proje
 	for _, service := range project.Services {
 		currentByName[service.Name] = service
 	}
+	report := ReconcileReport{Services: []ServiceChange{}}
 	for _, parsed := range incoming.Services {
 		currentService, exists := currentByName[parsed.Name]
 		if !exists {
 			parsed.ID = uuid.NewString()
 			parsed.ProjectID = project.ID
 			if err := insertService(ctx, tx, parsed); err != nil {
-				return err
+				return report, err
 			}
+			report.Services = append(report.Services, ServiceChange{Service: parsed.Name, Action: "added"})
 			continue
 		}
-		merged := mergeService(currentService, previousByName[parsed.Name], parsed, previous.Valid)
-		if err := updateComposedService(ctx, tx, merged, currentService.ConfigRevision); err != nil {
-			return err
+		// What the file produced when it was last applied is the only reliable
+		// way to tell an operator's value from the file's. A service recorded
+		// before that baseline existed falls back to re-parsing the previous
+		// file, which is right unless an env file changed on disk meanwhile.
+		baseline, known := previousByName[parsed.Name]
+		if recorded, ok := baselines[parsed.Name]; ok {
+			baseline, known = recorded.Service(parsed.Name), true
 		}
+		merged := mergeService(currentService, baseline, parsed, known)
+		change := describeChange(currentService, merged, parsed)
+		if err := updateComposedService(ctx, tx, merged, parsed, currentService.ConfigRevision, change.Action == "updated"); err != nil {
+			return report, err
+		}
+		report.Services = append(report.Services, change)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET primary_service=?,updated_at=? WHERE id=?`, incoming.PrimaryService, store.Now(), project.ID); err != nil {
-		return err
+	if _, err := tx.ExecContext(ctx, `UPDATE projects SET primary_service=?,updated_at=? WHERE id=?`, incoming.PrimaryService, store.Now(), project.ID); err != nil {
+		return report, err
 	}
-	rollback, err := replaceFile(project.SourcePath, spec, current, content)
-	if err != nil {
-		return err
+	if err := install(); err != nil {
+		return report, err
 	}
-	if err = tx.Commit(); err != nil {
-		_ = rollback.rollback()
-		return err
+	if err := tx.Commit(); err != nil {
+		return report, err
 	}
-	return rollback.commit()
+	return report, nil
 }
 
 // mergeService reconciles a service the operator has been running with the one
@@ -539,6 +516,8 @@ func mergeService(current, previous, incoming store.Service, previousValid bool)
 	merged.ID = current.ID
 	merged.ProjectID = current.ProjectID
 	merged.ConfigRevision = current.ConfigRevision
+	// Compose has no HSTS setting, so the stored mode is always the operator's.
+	merged.HSTSMode = current.HSTSMode
 	if !previousValid || previous.Name == "" {
 		merged.Role = current.Role
 		merged.Environment = cloneMap(current.Environment)
@@ -626,32 +605,50 @@ func insertService(ctx context.Context, tx *sql.Tx, service store.Service) error
 	dependsOn, _ := json.Marshal(service.DependsOn)
 	volumes, _ := json.Marshal(service.Volumes)
 	now := store.Now()
-	_, err := tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,config_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, service.ID, service.ProjectID, service.Name, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, now)
+	_, err := tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,config_json,composed_json,public,port,hostname,health_path,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, service.ID, service.ProjectID, service.Name, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), store.ComposedJSON(service), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, now)
 	if err != nil {
 		return err
 	}
 	return syncVolumes(ctx, tx, service, now)
 }
 
-func updateComposedService(ctx context.Context, tx *sql.Tx, service store.Service, expectedRevision int) error {
+// updateComposedService stores a merged service and records parsed — what the
+// file produced — as the baseline the next reconcile compares against. A
+// service the file left as it was keeps its configuration revision, so a
+// re-sync that changed nothing does not invalidate a revision an operator or
+// agent is holding.
+func updateComposedService(ctx context.Context, tx *sql.Tx, service, parsed store.Service, expectedRevision int, changed bool) error {
+	if !changed {
+		result, err := tx.ExecContext(ctx, `UPDATE services SET composed_json=? WHERE id=? AND config_revision=?`, store.ComposedJSON(parsed), service.ID, expectedRevision)
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil || count == 0 {
+			return revisionConflict(err)
+		}
+		return nil
+	}
 	command, _ := json.Marshal(service.Command)
 	environment, _ := json.Marshal(service.Environment)
 	config, _ := json.Marshal(service.Container)
 	dependsOn, _ := json.Marshal(service.DependsOn)
 	volumes, _ := json.Marshal(service.Volumes)
 	now := store.Now()
-	result, err := tx.ExecContext(ctx, `UPDATE services SET role=?,image=?,build_context=?,dockerfile=?,command_json=?,env_json=?,config_json=?,public=?,port=?,hostname=?,health_path=?,cpu_limit=?,memory_limit=?,pids_limit=?,restart_policy=?,depends_on_json=?,volumes_json=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), service.Public, service.Port, service.Hostname, service.HealthPath, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, service.ID, expectedRevision)
+	result, err := tx.ExecContext(ctx, `UPDATE services SET role=?,image=?,build_context=?,dockerfile=?,command_json=?,env_json=?,config_json=?,composed_json=?,public=?,port=?,hostname=?,health_path=?,hsts_mode=?,cpu_limit=?,memory_limit=?,pids_limit=?,restart_policy=?,depends_on_json=?,volumes_json=?,config_revision=config_revision+1,updated_at=? WHERE id=? AND config_revision=?`, service.Role, service.Image, service.BuildContext, service.Dockerfile, string(command), string(environment), string(config), store.ComposedJSON(parsed), service.Public, service.Port, service.Hostname, service.HealthPath, service.HSTSMode, service.CPULimit, service.MemoryLimit, service.PIDsLimit, service.RestartPolicy, string(dependsOn), string(volumes), now, service.ID, expectedRevision)
 	if err != nil {
 		return err
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return &Problem{Code: "service_revision_conflict", Message: "A service configuration changed while Compose was being saved. Refresh and apply the edit again."}
+	if count, err := result.RowsAffected(); err != nil || count == 0 {
+		return revisionConflict(err)
 	}
 	return syncVolumes(ctx, tx, service, now)
+}
+
+func revisionConflict(err error) error {
+	if err != nil {
+		return err
+	}
+	return &Problem{Code: "service_revision_conflict", Message: "A service configuration changed while Compose was being saved. Refresh and apply the edit again."}
 }
 
 func syncVolumes(ctx context.Context, tx *sql.Tx, service store.Service, now string) error {

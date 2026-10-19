@@ -274,10 +274,39 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	if err = d.Store.FinishRelease(ctx, release.ID, deployment.ID, "succeeded", ""); err != nil {
 		return err
 	}
-	_ = d.Store.TrimReleases(ctx, project.ID, 5)
-	progress(100, fmt.Sprintf("Release r%d is live", release.Version))
 	succeeded = true
+	_ = d.Store.TrimReleases(ctx, project.ID, 5)
+	// Reclaim only once the previous release's containers are gone: before
+	// that, their images are still referenced and cannot be freed, and the
+	// time it takes was being reported as the route switch.
+	if d.Reclaimer != nil {
+		progress(90, "Reclaiming storage from aged-out releases")
+		d.reclaim(ctx, log)
+	}
+	progress(100, releaseSummary(release.Version, ordered, kept))
 	return nil
+}
+
+// releaseSummary names what a release actually replaced. "Release r21 is
+// live" alone reads as success even when every container was carried over and
+// the change the operator meant to ship never reached one.
+func releaseSummary(version int, services []store.Service, kept map[string]bool) string {
+	recreated, unchanged := []string{}, 0
+	for _, svc := range services {
+		if kept[svc.ID] {
+			unchanged++
+			continue
+		}
+		recreated = append(recreated, svc.Name)
+	}
+	switch {
+	case len(recreated) == 0:
+		return fmt.Sprintf("Release r%d is live; nothing changed, so all %d services kept their running containers", version, unchanged)
+	case unchanged == 0:
+		return fmt.Sprintf("Release r%d is live; recreated all %d services", version, len(recreated))
+	default:
+		return fmt.Sprintf("Release r%d is live; recreated %s and kept %d unchanged", version, strings.Join(recreated, ", "), unchanged)
+	}
 }
 
 // createMountDirectory creates the source-tree directory a project-relative
@@ -447,7 +476,6 @@ func (d *Deployer) switchRelease(ctx context.Context, project store.Project, ser
 			return fmt.Errorf("confirm edge route %s: %w", svc.Name, err)
 		}
 	}
-	d.reclaim(ctx, log)
 	return nil
 }
 

@@ -51,22 +51,19 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusPreconditionRequired, "revision_required", err.Error())
 		return
 	}
-	settings := composecfg.ServiceSettings{Role: body.Role, Environment: body.Environment, Public: body.Public, Port: body.Port, Hostname: body.Hostname, HealthPath: body.HealthPath, HSTSMode: body.HSTSMode, CPULimit: body.CPULimit, MemoryLimit: body.MemoryLimit, PIDsLimit: body.PIDsLimit, RestartPolicy: body.RestartPolicy}
+	environment := body.Environment
+	if environment == nil {
+		// Leaving the environment out keeps it. Treating a missing field as an
+		// empty one wiped every variable of a service whose caller only meant
+		// to change its route.
+		environment = composecfg.SettingsOf(current).Environment
+	}
+	settings := composecfg.ServiceSettings{Role: body.Role, Environment: environment, Public: body.Public, Port: body.Port, Hostname: body.Hostname, HealthPath: body.HealthPath, HSTSMode: body.HSTSMode, CPULimit: body.CPULimit, MemoryLimit: body.MemoryLimit, PIDsLimit: body.PIDsLimit, RestartPolicy: body.RestartPolicy}
 	if err := settings.Normalize(s.Config.Domain); err != nil {
 		writeSettingsError(w, err)
 		return
 	}
-	current.Role = settings.Role
-	current.Environment = settings.Environment
-	current.Public = settings.Public
-	current.Port = settings.Port
-	current.Hostname = settings.Hostname
-	current.HealthPath = settings.HealthPath
-	current.HSTSMode = settings.HSTSMode
-	current.CPULimit = settings.CPULimit
-	current.MemoryLimit = settings.MemoryLimit
-	current.PIDsLimit = settings.PIDsLimit
-	current.RestartPolicy = settings.RestartPolicy
+	settings.ApplyTo(&current)
 	if err := s.Store.UpdateService(r.Context(), current, revision); err != nil {
 		httpx.Error(w, http.StatusConflict, "revision_conflict", err.Error())
 		return

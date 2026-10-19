@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rousoftware/asgard/internal/store"
 )
 
 func TestReplaceTreeAppliesIncomingComposeAndKeepsRuntimeOverrides(t *testing.T) {
@@ -56,7 +58,7 @@ x-asgard:
 		t.Fatal(err)
 	}
 	swapped := false
-	validation, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", string(current), incoming, incomingRoot, func() error {
+	validation, _, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", string(current), incoming, incomingRoot, func() error {
 		swapped = true
 		return os.WriteFile(filepath.Join(project.SourcePath, project.ComposePath), []byte(incoming), 0o640)
 	})
@@ -109,7 +111,7 @@ func TestReplaceTreeLeavesLiveTreeAloneWhenIncomingIsUnusable(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			swapped := false
-			if _, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", original, incoming, incomingRoot, func() error {
+			if _, _, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", original, incoming, incomingRoot, func() error {
 				swapped = true
 				return nil
 			}); err == nil {
@@ -127,4 +129,100 @@ func TestReplaceTreeLeavesLiveTreeAloneWhenIncomingIsUnusable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// writeProjectFile replaces one file in a project's live source tree.
+func writeProjectFile(t *testing.T, root, relative, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, relative), []byte(content), 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const envFileCompose = `services:
+  app:
+    image: nginx:1.27
+    env_file: .env
+`
+
+// A .env edited on the host before a re-sync is already on disk when the
+// re-sync reads the "previous" Compose file, so comparing against a fresh parse
+// made the stored value look like an operator override and kept it forever.
+// The baseline has to be what the file produced when it was last applied.
+func TestReplaceTreeAppliesDotEnvValueChangedBeforeResync(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, ".env", "TTS_RPM=8\nKEEP=same\n")
+	project, database := createProjectIn(t, root, envFileCompose)
+	if got := project.Services[0].Environment["TTS_RPM"]; got != "8" {
+		t.Fatalf("fixture TTS_RPM = %q", got)
+	}
+
+	writeProjectFile(t, project.SourcePath, ".env", "TTS_RPM=100\nKEEP=same\n")
+	incomingRoot := t.TempDir()
+	writeProjectFile(t, incomingRoot, "compose.yaml", envFileCompose)
+	writeProjectFile(t, incomingRoot, ".env", "TTS_RPM=100\nKEEP=same\n")
+
+	report, err := replaceTree(t, database, project, envFileCompose, incomingRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, _ = database.GetProject(context.Background(), project.ID)
+	if got := project.Services[0].Environment["TTS_RPM"]; got != "100" {
+		t.Fatalf("TTS_RPM = %q, want the .env value 100", got)
+	}
+	change := report.Service("app")
+	if change.Action != "updated" || !contains(change.Changed, "environment.TTS_RPM") {
+		t.Fatalf("report = %#v", change)
+	}
+}
+
+// An override set through Asgard still wins over the file, and the re-sync says
+// so instead of presenting the file's value as if it had been applied.
+func TestReplaceTreeReportsOverridesItKeeps(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, ".env", "TTS_RPM=8\n")
+	project, database := createProjectIn(t, root, envFileCompose)
+	service := project.Services[0]
+	service.Environment["TTS_RPM"] = "50"
+	if err := database.UpdateService(context.Background(), service, service.ConfigRevision); err != nil {
+		t.Fatal(err)
+	}
+	project, _ = database.GetProject(context.Background(), project.ID)
+
+	incomingRoot := t.TempDir()
+	writeProjectFile(t, incomingRoot, "compose.yaml", envFileCompose)
+	writeProjectFile(t, incomingRoot, ".env", "TTS_RPM=100\n")
+	report, err := replaceTree(t, database, project, envFileCompose, incomingRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, _ = database.GetProject(context.Background(), project.ID)
+	if got := project.Services[0].Environment["TTS_RPM"]; got != "50" {
+		t.Fatalf("TTS_RPM = %q, want the operator's 50", got)
+	}
+	change := report.Service("app")
+	if change.Action != "unchanged" || !contains(change.KeptOverrides, "environment.TTS_RPM") {
+		t.Fatalf("report = %#v", change)
+	}
+}
+
+func replaceTree(t *testing.T, database *store.Store, project store.Project, current, incomingRoot string) (ReconcileReport, error) {
+	t.Helper()
+	incoming, err := os.ReadFile(filepath.Join(incomingRoot, "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, report, err := ReplaceTree(context.Background(), database, project, "asgard.example.com", current, string(incoming), incomingRoot, func() error {
+		return nil
+	})
+	return report, err
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }

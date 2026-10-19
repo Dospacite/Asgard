@@ -122,20 +122,40 @@ type ActionInput struct {
 	ServiceID string `json:"serviceId" jsonschema:"required,service identifier"`
 	Action    string `json:"action" jsonschema:"required,start stop or restart"`
 }
+
+// ConfigInput is a partial update: a field left out keeps its stored value.
+// The environment can be replaced whole with environment, or changed one
+// variable at a time with environmentSet and environmentUnset, which is how an
+// agent changes a setting without reading and resending every secret beside it.
 type ConfigInput struct {
-	ServiceID      string            `json:"serviceId" jsonschema:"required,service identifier"`
-	ConfigRevision int               `json:"configRevision" jsonschema:"required,optimistic concurrency revision"`
-	Role           string            `json:"role" jsonschema:"required,web worker or stateful"`
-	Environment    map[string]string `json:"environment,omitempty"`
-	Public         bool              `json:"public"`
-	Port           int               `json:"port"`
-	Hostname       string            `json:"hostname,omitempty"`
-	HealthPath     string            `json:"healthPath"`
-	HSTSMode       string            `json:"hstsMode,omitempty" jsonschema:"HSTS policy for the public route: empty derives it from the hostname (strong inside the control plane's own domain, plain max-age elsewhere), standard sends max-age for this host only, strict adds includeSubDomains and preload and commits every subdomain of the domain, off sends no header"`
-	CPULimit       float64           `json:"cpuLimit"`
-	MemoryLimit    int64             `json:"memoryLimit"`
-	PIDsLimit      int64             `json:"pidsLimit"`
-	RestartPolicy  string            `json:"restartPolicy"`
+	ServiceID        string            `json:"serviceId" jsonschema:"required,service identifier"`
+	ConfigRevision   int               `json:"configRevision" jsonschema:"required,optimistic concurrency revision from service_get"`
+	Role             *string           `json:"role,omitempty" jsonschema:"web worker or stateful"`
+	Environment      map[string]string `json:"environment,omitempty" jsonschema:"replaces the whole environment; omit to keep it and use environmentSet or environmentUnset for single variables"`
+	EnvironmentSet   map[string]string `json:"environmentSet,omitempty" jsonschema:"variables to add or change, leaving every other variable as it is"`
+	EnvironmentUnset []string          `json:"environmentUnset,omitempty" jsonschema:"variable names to remove"`
+	Public           *bool             `json:"public,omitempty"`
+	Port             *int              `json:"port,omitempty"`
+	Hostname         *string           `json:"hostname,omitempty"`
+	HealthPath       *string           `json:"healthPath,omitempty"`
+	HSTSMode         *string           `json:"hstsMode,omitempty" jsonschema:"HSTS policy for the public route: empty derives it from the hostname (strong inside the control plane's own domain, plain max-age elsewhere), standard sends max-age for this host only, strict adds includeSubDomains and preload and commits every subdomain of the domain, off sends no header"`
+	CPULimit         *float64          `json:"cpuLimit,omitempty"`
+	MemoryLimit      *int64            `json:"memoryLimit,omitempty"`
+	PIDsLimit        *int64            `json:"pidsLimit,omitempty"`
+	RestartPolicy    *string           `json:"restartPolicy,omitempty"`
+}
+type ServiceGetInput struct {
+	ServiceID     string `json:"serviceId" jsonschema:"required,service identifier"`
+	RevealSecrets bool   `json:"revealSecrets,omitempty" jsonschema:"return secret-looking environment values instead of redacting them; they end up in the transcript, so only ask when the value itself is needed"`
+}
+type ProjectSourceInput struct {
+	ProjectID     string `json:"projectId" jsonschema:"required,project identifier or slug"`
+	RevealSecrets bool   `json:"revealSecrets,omitempty" jsonschema:"return secret-looking .env values instead of redacting them"`
+}
+type DotEnvUpdateInput struct {
+	ProjectID string            `json:"projectId" jsonschema:"required,project identifier or slug"`
+	Set       map[string]string `json:"set,omitempty" jsonschema:"variables to add or change in the project's .env"`
+	Unset     []string          `json:"unset,omitempty" jsonschema:"variable names to remove from the project's .env"`
 }
 type ReclaimInput struct {
 	DryRun       bool `json:"dryRun,omitempty" jsonschema:"report what would be freed without freeing it"`
@@ -202,6 +222,9 @@ func (s *Server) addTools() {
 			return nil, nil, err
 		}
 		items, err := s.Store.ListProjects(ctx)
+		for index := range items {
+			items[index] = redactProject(items[index])
+		}
 		return nil, map[string]any{"items": items}, err
 	})
 	mcp.AddTool(s.MCP, readTool("project_get", "Get project", "Get one project by UUID or slug, including its services."), func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectInput) (*mcp.CallToolResult, any, error) {
@@ -209,22 +232,25 @@ func (s *Server) addTools() {
 			return nil, nil, err
 		}
 		item, err := s.Store.GetProject(ctx, in.ProjectID)
-		return nil, item, err
+		return nil, redactProject(item), err
 	})
-	mcp.AddTool(s.MCP, readTool("project_source_get", "Get project source", "Return the editable Compose file, Dockerfiles, .env file, validation state, and per-file revisions."), s.projectSource)
+	mcp.AddTool(s.MCP, readTool("project_source_get", "Get project source", "Return the editable Compose file, Dockerfiles, .env file, validation state, and per-file revisions. Secret-looking .env values are redacted unless revealSecrets is set; change single .env variables with project_env_update."), s.projectSource)
 	mcp.AddTool(s.MCP, readTool("services_list", "List project services", "List the services belonging to a project."), func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectInput) (*mcp.CallToolResult, any, error) {
 		if err := require(ctx, "asgard:read"); err != nil {
 			return nil, nil, err
 		}
 		project, err := s.Store.GetProject(ctx, in.ProjectID)
-		return nil, map[string]any{"items": project.Services}, err
+		return nil, map[string]any{"items": redactServices(project.Services)}, err
 	})
-	mcp.AddTool(s.MCP, readTool("service_get", "Get service", "Get service configuration, runtime state, limits, and latest metrics."), func(ctx context.Context, _ *mcp.CallToolRequest, in ServiceInput) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(s.MCP, readTool("service_get", "Get service", "Get service configuration, runtime state, limits, and latest metrics. Secret-looking environment values are redacted unless revealSecrets is set."), func(ctx context.Context, _ *mcp.CallToolRequest, in ServiceGetInput) (*mcp.CallToolResult, any, error) {
 		if err := require(ctx, "asgard:read"); err != nil {
 			return nil, nil, err
 		}
 		item, err := s.Store.GetService(ctx, in.ServiceID)
-		return nil, item, err
+		if err != nil || in.RevealSecrets {
+			return nil, item, err
+		}
+		return nil, redactService(item), nil
 	})
 	mcp.AddTool(s.MCP, readTool("service_stats_get", "Get service metrics", "Return live and recent CPU, RAM, I/O, network, PID, and CPU-throttling metrics. Read the throttling summary before concluding a service is idle: a request-serving workload bursts against its CPU quota in well under a second, so it can average near-zero CPU while being stopped at the ceiling in a large share of scheduling periods."), func(ctx context.Context, _ *mcp.CallToolRequest, in ServiceInput) (*mcp.CallToolResult, any, error) {
 		if err := require(ctx, "asgard:read"); err != nil {
@@ -320,10 +346,11 @@ func (s *Server) addTools() {
 	mcp.AddTool(s.MCP, writeTool("git_credential_delete", "Delete a Git credential", "Remove a stored Git credential. Projects already imported with it keep their source.", true, true, false), s.deleteGitCredential)
 	mcp.AddTool(s.MCP, writeTool("project_import_image", "Import public OCI image", "Create a project from a public OCI image or Docker Hub URL.", false, false, true), s.importImage)
 	mcp.AddTool(s.MCP, writeTool("project_source_update", "Update project source file", "Revision-check, validate, and replace one editable Compose, Dockerfile, or .env file. Compose saves reconcile source-owned service fields while preserving runtime overrides.", true, false, false), s.updateProjectSource)
-	mcp.AddTool(s.MCP, writeTool("project_source_resync", "Re-sync project source from Git", "Re-clone a Git-imported project's repository and replace its working tree, so the next deployment builds the branch's current head instead of the commit captured at import. Returns the synced commit. Deployments do not fetch on their own: call this first whenever new commits should go live. The project's .env is preserved and runtime overrides survive; an invalid incoming Compose file leaves the running project untouched.", true, false, true), s.resyncProjectSource)
+	mcp.AddTool(s.MCP, writeTool("project_source_resync", "Re-sync project source from Git", "Re-clone a Git-imported project's repository and replace its working tree, so the next deployment builds the branch's current head instead of the commit captured at import. Returns the synced commit. Deployments do not fetch on their own: call this first whenever new commits should go live. The project's .env is preserved and runtime overrides survive; an invalid incoming Compose file leaves the running project untouched. The reconcile field says which services' stored configuration changed and which file values were held back by an override set through Asgard (keptOverrides); validation only previews what the file asks for.", true, false, true), s.resyncProjectSource)
 	mcp.AddTool(s.MCP, writeTool("deployment_create", "Deploy project", "Queue an idempotent, health-gated versioned deployment and return its operation. The response names the commit being built: a deployment rebuilds the tree captured at import or the last project_source_resync, so if you have just pushed, check source.behind and re-sync before deploying.", true, false, true), s.deploy)
 	mcp.AddTool(s.MCP, writeTool("deployment_rollback", "Roll back project", "Queue recreation of an earlier successful release and atomically switch traffic.", true, false, false), s.rollback)
-	mcp.AddTool(s.MCP, writeTool("service_config_update", "Update service configuration", "Update limits, public route, environment, role, and restart behavior with revision protection.", true, false, false), s.updateConfig)
+	mcp.AddTool(s.MCP, writeTool("service_config_update", "Update service configuration", "Update limits, public route, environment, role, and restart behavior with revision protection. Every field except serviceId and configRevision is optional and keeps its stored value when left out; change single environment variables with environmentSet and environmentUnset. A value set here is an override: later Compose saves and re-syncs keep it until it is changed here again. Takes effect on the next deployment.", true, false, false), s.updateConfig)
+	mcp.AddTool(s.MCP, writeTool("project_env_update", "Update project .env variables", "Set or remove single variables in the project's .env without resending the file, then apply the result to every service that reads it, exactly like a full .env save. Every other line is kept as it was. Takes effect on the next deployment.", true, false, false), s.updateDotEnv)
 	mcp.AddTool(s.MCP, writeTool("container_action", "Act on service container", "Start, stop, or restart the active service container.", false, false, false), s.containerAction)
 	mcp.AddTool(s.MCP, writeTool("network_create", "Create shared network", "Create an Asgard-managed bridge network for explicit service communication across projects.", false, false, false), s.networkCreate)
 	mcp.AddTool(s.MCP, writeTool("network_service_attach", "Attach service to network", "Persist and immediately reconcile a service membership with a stable network-scoped DNS alias.", false, false, false), s.networkAttach)
@@ -333,7 +360,7 @@ func (s *Server) addTools() {
 	mcp.AddTool(s.MCP, writeTool("deletion_confirm", "Confirm exact deletion", "Consume a preview token and delete only its exact bound project, container, or empty shared network. Named volumes are retained.", false, true, false), s.deletionConfirm)
 }
 
-func (s *Server) projectSource(ctx context.Context, _ *mcp.CallToolRequest, in ProjectInput) (*mcp.CallToolResult, any, error) {
+func (s *Server) projectSource(ctx context.Context, _ *mcp.CallToolRequest, in ProjectSourceInput) (*mcp.CallToolResult, any, error) {
 	if err := require(ctx, "asgard:read"); err != nil {
 		return nil, nil, err
 	}
@@ -342,7 +369,10 @@ func (s *Server) projectSource(ctx context.Context, _ *mcp.CallToolRequest, in P
 		return nil, nil, err
 	}
 	workspace, err := projectsource.Load(project)
-	return nil, workspace, err
+	if err != nil || in.RevealSecrets {
+		return nil, workspace, err
+	}
+	return nil, redactWorkspace(workspace), nil
 }
 
 func (s *Server) updateProjectSource(ctx context.Context, _ *mcp.CallToolRequest, in SourceUpdateInput) (*mcp.CallToolResult, any, error) {
@@ -353,12 +383,15 @@ func (s *Server) updateProjectSource(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, nil, err
 	}
+	if strings.Contains(in.Content, "="+RedactedValue) {
+		return nil, nil, errors.New("the content still holds redaction markers from project_source_get; change single .env variables with project_env_update, or read the file with revealSecrets before editing it whole")
+	}
 	workspace, err := projectsource.Save(ctx, s.Store, project, s.Config.Domain, in.Path, in.Content, in.Revision)
 	if err != nil {
 		return nil, nil, err
 	}
 	audit(ctx, s.Store, "project.source.update", "project", project.ID, "Agent updated source file "+filepath.ToSlash(filepath.Clean(in.Path)))
-	return nil, workspace, nil
+	return nil, redactWorkspace(workspace), nil
 }
 
 func (s *Server) resyncProjectSource(ctx context.Context, _ *mcp.CallToolRequest, in ProjectInput) (*mcp.CallToolResult, any, error) {
@@ -373,7 +406,9 @@ func (s *Server) resyncProjectSource(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, nil, err
 	}
-	audit(ctx, s.Store, "project.source.resync", "project", project.ID, "Agent re-synced source to "+result.Commit)
+	audit(ctx, s.Store, "project.source.resync", "project", project.ID, "Agent re-synced source to "+result.Commit+": "+result.Summary)
+	result.Project = redactProject(result.Project)
+	result.Validation.Services = redactServices(result.Validation.Services)
 	return nil, result, nil
 }
 
@@ -706,30 +741,76 @@ func (s *Server) updateConfig(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	if err != nil {
 		return nil, nil, err
 	}
-	// Same rules the REST API applies. This tool used to check only the role
-	// and hostname, so an agent could set limits, a restart policy, or a health
-	// path that the browser rejected on the identical field.
-	settings := composecfg.ServiceSettings{Role: in.Role, Environment: in.Environment, Public: in.Public, Port: in.Port, Hostname: in.Hostname, HealthPath: in.HealthPath, HSTSMode: in.HSTSMode, CPULimit: in.CPULimit, MemoryLimit: in.MemoryLimit, PIDsLimit: in.PIDsLimit, RestartPolicy: in.RestartPolicy}
+	settings := composecfg.SettingsOf(svc)
+	if in.Environment != nil {
+		settings.Environment = in.Environment
+	}
+	for name, value := range in.EnvironmentSet {
+		settings.Environment[name] = value
+	}
+	for _, name := range in.EnvironmentUnset {
+		delete(settings.Environment, name)
+	}
+	if err := rejectRedacted(settings.Environment); err != nil {
+		return nil, nil, err
+	}
+	assign(&settings.Role, in.Role)
+	assign(&settings.Public, in.Public)
+	assign(&settings.Port, in.Port)
+	assign(&settings.Hostname, in.Hostname)
+	assign(&settings.HealthPath, in.HealthPath)
+	assign(&settings.HSTSMode, in.HSTSMode)
+	assign(&settings.CPULimit, in.CPULimit)
+	assign(&settings.MemoryLimit, in.MemoryLimit)
+	assign(&settings.PIDsLimit, in.PIDsLimit)
+	assign(&settings.RestartPolicy, in.RestartPolicy)
+	// Same rules the REST API applies, so a field the browser rejects is
+	// rejected here too.
 	if err := settings.Normalize(s.Config.Domain); err != nil {
 		return nil, nil, err
 	}
-	svc.Role = settings.Role
-	svc.Environment = settings.Environment
-	svc.Public = settings.Public
-	svc.Port = settings.Port
-	svc.Hostname = settings.Hostname
-	svc.HealthPath = settings.HealthPath
-	svc.HSTSMode = settings.HSTSMode
-	svc.CPULimit = settings.CPULimit
-	svc.MemoryLimit = settings.MemoryLimit
-	svc.PIDsLimit = settings.PIDsLimit
-	svc.RestartPolicy = settings.RestartPolicy
+	settings.ApplyTo(&svc)
 	if err = s.Store.UpdateService(ctx, svc, in.ConfigRevision); err != nil {
 		return nil, nil, err
 	}
 	audit(ctx, s.Store, "service.update", "service", svc.ID, "Agent updated service configuration")
 	updated, err := s.Store.GetService(ctx, svc.ID)
-	return nil, updated, err
+	return nil, redactService(updated), err
+}
+
+// assign overwrites target with an optional input that was provided.
+func assign[T any](target *T, value *T) {
+	if value != nil {
+		*target = *value
+	}
+}
+
+func (s *Server) updateDotEnv(ctx context.Context, _ *mcp.CallToolRequest, in DotEnvUpdateInput) (*mcp.CallToolResult, any, error) {
+	if err := require(ctx, "asgard:configure"); err != nil {
+		return nil, nil, err
+	}
+	project, err := s.Store.GetProject(ctx, in.ProjectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := rejectRedacted(in.Set); err != nil {
+		return nil, nil, err
+	}
+	workspace, err := projectsource.UpdateDotEnv(ctx, s.Store, project, s.Config.Domain, in.Set, in.Unset)
+	if err != nil {
+		return nil, nil, err
+	}
+	names := make([]string, 0, len(in.Set)+len(in.Unset))
+	for name := range in.Set {
+		names = append(names, name)
+	}
+	names = append(names, in.Unset...)
+	audit(ctx, s.Store, "project.source.update", "project", project.ID, "Agent changed .env variables "+strings.Join(names, ", "))
+	updated, err := s.Store.GetProject(ctx, project.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, map[string]any{"source": redactWorkspace(workspace), "services": redactServices(updated.Services)}, nil
 }
 
 // reclaimStorage frees Docker artifacts Asgard itself created.

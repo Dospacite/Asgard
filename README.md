@@ -289,6 +289,13 @@ Re-syncing re-clones the tracked ref, records the commit, preserves the
 project's `.env` and runtime overrides, and leaves the running project untouched
 if the incoming Compose file fails validation.
 
+**Overrides and the file.** Every service remembers what its Compose file (with
+its env files and `.env`) produced the last time it was applied. When the file
+changes, through the editor, a `.env` save, or a re-sync, a stored value that
+still matches that record takes the file's new value. A value that differs was
+set through Asgard and is kept. The re-sync result lists both: the fields it
+changed per service, and the `keptOverrides` it held back.
+
 You do not have to remember this. Every deployment reports the commit it is
 building and warns when the tracked ref has moved ahead of it.
 
@@ -404,10 +411,20 @@ Useful tools:
 
 - `project_source_get` / `project_source_update` — inspect and revision-safely
   edit a project's Compose, Dockerfile, and `.env`.
+- `project_env_update` — set or remove single `.env` variables and apply them
+  to the services that read the file.
 - `project_source_resync` — refresh a Git project's tree to its branch head.
 - `deployment_create` — queue a health-gated release; the response names the
   commit being built and flags a tree that has fallen behind.
 - `service_config_update` — runtime environment, limits, routing, HSTS mode.
+  Fields you leave out keep their values; `environmentSet` and
+  `environmentUnset` change single variables.
+
+Tool results redact secret-looking environment values (names containing KEY,
+SECRET, TOKEN, PASSWORD, CREDENTIAL and similar, and URLs with a password) as
+`[redacted]`, because agent transcripts are stored and shared more widely than
+the control plane. `service_get` and `project_source_get` accept
+`revealSecrets` when the value itself is needed.
 - `service_stats_get` — including CPU throttling, which is what actually
   explains a slow service.
 - `git_credentials_list`, `git_credential_create`, `git_credential_update`,

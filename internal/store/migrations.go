@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS services (
     command_json TEXT NOT NULL DEFAULT '[]',
     env_json TEXT NOT NULL DEFAULT '{}',
     config_json TEXT NOT NULL DEFAULT '{}',
+    composed_json TEXT NOT NULL DEFAULT '',
     public INTEGER NOT NULL DEFAULT 0,
     port INTEGER NOT NULL DEFAULT 0,
     hostname TEXT NOT NULL DEFAULT '',
@@ -394,6 +395,11 @@ var addedColumns = []struct{ table, column, definition string }{
 	// release ran.
 	{"services", "config_json", "TEXT NOT NULL DEFAULT '{}'"},
 	{"release_services", "config_json", "TEXT NOT NULL DEFAULT '{}'"},
+	// The runtime settings the Compose file produced the last time it was
+	// applied. A reconcile compares the stored value against this to tell an
+	// operator's override from a value the file has since changed. Empty for a
+	// service that predates it.
+	{"services", "composed_json", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // addedIndexes run after addedColumns, because an index over a column that a

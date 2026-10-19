@@ -154,7 +154,13 @@ func TestParseDotEnvReportsInvalidLines(t *testing.T) {
 
 func createProject(t *testing.T, compose string) (store.Project, *store.Store) {
 	t.Helper()
-	root := t.TempDir()
+	return createProjectIn(t, t.TempDir(), compose)
+}
+
+// createProjectIn imports compose from root, so a test can place files such as
+// a .env beside it first.
+func createProjectIn(t *testing.T, root, compose string) (store.Project, *store.Store) {
+	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte(compose), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -196,4 +202,29 @@ func problemCode(err error) string {
 		return problem.Code
 	}
 	return ""
+}
+
+func TestSaveDotEnvAppliesChangedValuesToServices(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("TTS_RPM=8\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	project, database := createProjectIn(t, root, "services:\n  app:\n    image: nginx:1.27\n    env_file: .env\n")
+	workspace, err := Load(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dotenv File
+	for _, file := range workspace.Files {
+		if file.Kind == "dotenv" {
+			dotenv = file
+		}
+	}
+	if _, err := Save(context.Background(), database, project, "asgard.example.com", dotenv.Path, "TTS_RPM=100\n", dotenv.Revision); err != nil {
+		t.Fatal(err)
+	}
+	project, _ = database.GetProject(context.Background(), project.ID)
+	if got := project.Services[0].Environment["TTS_RPM"]; got != "100" {
+		t.Fatalf("TTS_RPM = %q after saving .env, want 100", got)
+	}
 }

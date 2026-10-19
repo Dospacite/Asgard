@@ -278,3 +278,20 @@ func TestParseFailsOnRequiredVariable(t *testing.T) {
 		t.Fatal("${VAR:?message} must fail validation when the variable is unset")
 	}
 }
+
+// Containers receive what the source editor shows, which is what Compose reads.
+func TestParseEnvFileFollowsComposeQuotingAndComments(t *testing.T) {
+	values, err := ParseEnvFile([]byte("PLAIN=value # a note\nHASH=a#b\nSINGLE='{\"key\":\"a\\nb\"}'\nDOUBLE=\"line\\nnext\"\nEMPTY=\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"PLAIN": "value", "HASH": "a#b", "SINGLE": `{"key":"a\nb"}`, "DOUBLE": "line\nnext", "EMPTY": ""}
+	for key, value := range want {
+		if values[key] != value {
+			t.Errorf("%s = %q, want %q", key, values[key], value)
+		}
+	}
+	if _, err := ParseEnvFile([]byte("OPEN='unterminated\n")); err == nil {
+		t.Error("unterminated quote accepted")
+	}
+}

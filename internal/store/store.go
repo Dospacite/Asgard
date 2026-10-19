@@ -494,7 +494,9 @@ func (s *Store) CreateProject(ctx context.Context, p Project, services []Service
 		config, _ := json.Marshal(svc.Container)
 		deps, _ := json.Marshal(svc.DependsOn)
 		vols, _ := json.Marshal(svc.Volumes)
-		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,config_json,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, string(config), svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
+		// The services an import creates are exactly what its Compose file
+		// produced, so they are also the baseline later reconciles compare to.
+		_, err = tx.ExecContext(ctx, `INSERT INTO services(id,project_id,name,role,image,build_context,dockerfile,command_json,env_json,public,port,hostname,health_path,hsts_mode,config_json,composed_json,cpu_limit,memory_limit,pids_limit,restart_policy,depends_on_json,volumes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, svc.ID, p.ID, svc.Name, svc.Role, svc.Image, svc.BuildContext, svc.Dockerfile, string(cmd), string(env), svc.Public, svc.Port, svc.Hostname, svc.HealthPath, svc.HSTSMode, string(config), ComposedJSON(svc), svc.CPULimit, svc.MemoryLimit, svc.PIDsLimit, svc.RestartPolicy, string(deps), string(vols), now, now)
 		if err != nil {
 			return err
 		}

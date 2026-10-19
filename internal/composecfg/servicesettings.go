@@ -157,3 +157,28 @@ func NormalizeRoute(public bool, port int, hostname, controlPlaneDomain string) 
 		return "", settingsError("invalid_hostname", "Hostname must be a fully qualified DNS name, such as app.example.com, whose DNS points at this host.")
 	}
 }
+
+// SettingsOf returns a service's current operator-editable settings, so an
+// update can start from what is stored and change only what it names.
+func SettingsOf(svc store.Service) ServiceSettings {
+	environment := make(map[string]string, len(svc.Environment))
+	for name, value := range svc.Environment {
+		environment[name] = value
+	}
+	return ServiceSettings{Role: svc.Role, Environment: environment, Public: svc.Public, Port: svc.Port, Hostname: svc.Hostname, HealthPath: svc.HealthPath, HSTSMode: svc.HSTSMode, CPULimit: svc.CPULimit, MemoryLimit: svc.MemoryLimit, PIDsLimit: svc.PIDsLimit, RestartPolicy: svc.RestartPolicy}
+}
+
+// ApplyTo copies normalized settings onto a service.
+func (s ServiceSettings) ApplyTo(svc *store.Service) {
+	svc.Role = s.Role
+	svc.Environment = s.Environment
+	svc.Public = s.Public
+	svc.Port = s.Port
+	svc.Hostname = s.Hostname
+	svc.HealthPath = s.HealthPath
+	svc.HSTSMode = s.HSTSMode
+	svc.CPULimit = s.CPULimit
+	svc.MemoryLimit = s.MemoryLimit
+	svc.PIDsLimit = s.PIDsLimit
+	svc.RestartPolicy = s.RestartPolicy
+}

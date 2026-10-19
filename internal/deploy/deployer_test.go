@@ -45,3 +45,17 @@ func TestKeepable(t *testing.T) {
 		})
 	}
 }
+
+func TestReleaseSummaryNamesWhatWasRecreated(t *testing.T) {
+	services := []store.Service{{ID: "a", Name: "api"}, {ID: "b", Name: "db"}}
+	cases := map[string]map[string]bool{
+		"Release r7 is live; nothing changed, so all 2 services kept their running containers": {"a": true, "b": true},
+		"Release r7 is live; recreated api and kept 1 unchanged":                               {"b": true},
+		"Release r7 is live; recreated all 2 services":                                         {},
+	}
+	for want, kept := range cases {
+		if got := releaseSummary(7, services, kept); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+}

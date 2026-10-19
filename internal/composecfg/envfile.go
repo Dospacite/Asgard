@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -94,8 +95,12 @@ func loadEnvFiles(refs []EnvFileRef, source Source) (map[string]string, error) {
 }
 
 // ParseEnvFile reads the KEY=VALUE format Docker Compose accepts: blank lines
-// and "#" comments are ignored, an optional "export " prefix is dropped, and a
-// fully single- or double-quoted value is unquoted.
+// and "#" comments are ignored, an optional "export " prefix is dropped, a
+// single-quoted value is literal, a double-quoted value has its escapes
+// decoded, and an unquoted value ends at a " #" comment.
+//
+// The source editor validates .env files with this same parser, so the values
+// it shows are the values containers receive.
 func ParseEnvFile(data []byte) (map[string]string, error) {
 	values := map[string]string{}
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
@@ -103,20 +108,13 @@ func ParseEnvFile(data []byte) (map[string]string, error) {
 	line := 0
 	for scanner.Scan() {
 		line++
-		text := strings.TrimSpace(scanner.Text())
-		if text == "" || strings.HasPrefix(text, "#") {
-			continue
+		key, value, ok, err := ParseEnvLine(scanner.Text())
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", line, err)
 		}
-		text = strings.TrimPrefix(text, "export ")
-		key, value, found := strings.Cut(text, "=")
-		if !found {
-			return nil, fmt.Errorf("line %d is not KEY=VALUE", line)
+		if ok {
+			values[key] = value
 		}
-		key = strings.TrimSpace(key)
-		if !environmentVariablePattern.MatchString(key) {
-			return nil, fmt.Errorf("line %d has an invalid variable name %q", line, key)
-		}
-		values[key] = unquoteEnvValue(strings.TrimSpace(value))
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -124,12 +122,93 @@ func ParseEnvFile(data []byte) (map[string]string, error) {
 	return values, nil
 }
 
-func unquoteEnvValue(value string) string {
-	if len(value) >= 2 {
-		first, last := value[0], value[len(value)-1]
-		if first == last && (first == '"' || first == '\'') {
-			return value[1 : len(value)-1]
+// ParseEnvLine parses one line of an env file. ok is false for a blank line or
+// a comment.
+func ParseEnvLine(raw string) (key, value string, ok bool, err error) {
+	text := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+	if text == "" || strings.HasPrefix(text, "#") {
+		return "", "", false, nil
+	}
+	if strings.HasPrefix(text, "export ") {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "export "))
+	}
+	key, rawValue, found := strings.Cut(text, "=")
+	key = strings.TrimSpace(key)
+	if !found || !environmentVariablePattern.MatchString(key) {
+		return "", "", false, errors.New("use KEY=VALUE with a variable name made of letters, numbers, and underscores")
+	}
+	value, err = ParseEnvValue(strings.TrimSpace(rawValue))
+	if err != nil {
+		return "", "", false, err
+	}
+	return key, value, true, nil
+}
+
+// ParseEnvValue decodes the right-hand side of a KEY=VALUE line.
+func ParseEnvValue(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	switch raw[0] {
+	case '\'':
+		end := strings.Index(raw[1:], "'")
+		if end < 0 {
+			return "", errors.New("single-quoted value is missing its closing quote")
+		}
+		end++
+		if err := onlyComment(raw[end+1:]); err != nil {
+			return "", err
+		}
+		return raw[1:end], nil
+	case '"':
+		end := closingDoubleQuote(raw)
+		if end < 0 {
+			return "", errors.New("double-quoted value is missing its closing quote")
+		}
+		if err := onlyComment(raw[end+1:]); err != nil {
+			return "", err
+		}
+		value, err := strconv.Unquote(raw[:end+1])
+		if err != nil {
+			return "", errors.New("double-quoted value contains an invalid escape sequence")
+		}
+		return value, nil
+	}
+	for index, r := range raw {
+		if r == '#' && index > 0 && (raw[index-1] == ' ' || raw[index-1] == '\t') {
+			return strings.TrimSpace(raw[:index]), nil
 		}
 	}
-	return value
+	return raw, nil
+}
+
+func onlyComment(trailing string) error {
+	trailing = strings.TrimSpace(trailing)
+	if trailing != "" && !strings.HasPrefix(trailing, "#") {
+		return errors.New("unexpected text after the quoted value")
+	}
+	return nil
+}
+
+func closingDoubleQuote(raw string) int {
+	escaped := false
+	for index := 1; index < len(raw); index++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if raw[index] == '\\' {
+			escaped = true
+			continue
+		}
+		if raw[index] == '"' {
+			return index
+		}
+	}
+	return -1
+}
+
+// ValidEnvironmentName reports whether name can be an environment variable.
+func ValidEnvironmentName(name string) bool {
+	return environmentVariablePattern.MatchString(name)
 }
