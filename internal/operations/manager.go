@@ -80,7 +80,7 @@ func (m *Manager) run(root context.Context, id string) {
 		return
 	}
 	_ = m.store.LogOperation(ctx, id, "info", "Operation started")
-	err = handler(ctx, op)
+	err = safely(ctx, handler, op)
 	if err == nil {
 		_ = m.store.LogOperation(ctx, id, "info", "Operation completed")
 		_ = m.store.CompleteOperation(ctx, id, "succeeded", "")
@@ -110,4 +110,15 @@ func (m *Manager) Cancel(id string) error {
 	}
 	cancel()
 	return nil
+}
+
+// safely runs a handler and turns a panic into the operation's failure. A
+// panic in one deployment used to take the whole control plane down with it.
+func safely(ctx context.Context, handler Handler, op store.Operation) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("operation handler panicked: %v", recovered)
+		}
+	}()
+	return handler(ctx, op)
 }

@@ -94,6 +94,9 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	if err != nil {
 		return err
 	}
+	if err := d.checkHostnames(ctx, project.ID, services); err != nil {
+		return err
+	}
 	release, deployment, err := d.Store.BeginRelease(ctx, project.ID, op.ID, payload.Trigger, sourceRevision, string(composeBytes), services)
 	if err != nil {
 		return err
@@ -275,7 +278,7 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 		return err
 	}
 	succeeded = true
-	_ = d.Store.TrimReleases(ctx, project.ID, 5)
+	_ = d.Store.TrimReleases(ctx, project.ID, d.releasesToKeep())
 	// Reclaim only once the previous release's containers are gone: before
 	// that, their images are still referenced and cannot be freed, and the
 	// time it takes was being reported as the route switch.
@@ -285,6 +288,19 @@ func (d *Deployer) deploy(ctx context.Context, op store.Operation, payload Paylo
 	}
 	progress(100, releaseSummary(release.Version, ordered, kept))
 	return nil
+}
+
+// minReleaseHistory is how many successful releases a project keeps at least.
+const minReleaseHistory = 5
+
+// releasesToKeep keeps at least as many releases as have images retained for
+// rollback; trimming to fewer would delete rollback targets whose images the
+// reclaimer was told to keep.
+func (d *Deployer) releasesToKeep() int {
+	if d.Reclaimer != nil && d.Reclaimer.Policy.KeepReleases > minReleaseHistory {
+		return d.Reclaimer.Policy.KeepReleases
+	}
+	return minReleaseHistory
 }
 
 // releaseSummary names what a release actually replaced. "Release r21 is
@@ -307,6 +323,35 @@ func releaseSummary(version int, services []store.Service, kept map[string]bool)
 	default:
 		return fmt.Sprintf("Release r%d is live; recreated %s and kept %d unchanged", version, strings.Join(recreated, ", "), unchanged)
 	}
+}
+
+// checkHostnames refuses a release whose public hostnames are already routed
+// elsewhere, before anything is built. The routes table would refuse it anyway,
+// but only at the route switch, after every image was built and every
+// container passed its health gate, and as a bare constraint error.
+func (d *Deployer) checkHostnames(ctx context.Context, projectID string, services []store.Service) error {
+	seen := map[string]string{}
+	hostnames := []string{}
+	for _, svc := range services {
+		if !svc.Public || svc.Hostname == "" {
+			continue
+		}
+		if other, ok := seen[svc.Hostname]; ok {
+			return fmt.Errorf("services %s and %s both route %s; give each public service its own hostname", other, svc.Name, svc.Hostname)
+		}
+		seen[svc.Hostname] = svc.Name
+		hostnames = append(hostnames, svc.Hostname)
+	}
+	owners, err := d.Store.HostnameOwners(ctx, projectID, hostnames)
+	if err != nil {
+		return err
+	}
+	for _, hostname := range hostnames {
+		if owner, taken := owners[hostname]; taken {
+			return fmt.Errorf("%s is already routed to project %s; choose another hostname for %s", hostname, owner, seen[hostname])
+		}
+	}
+	return nil
 }
 
 // createMountDirectory creates the source-tree directory a project-relative

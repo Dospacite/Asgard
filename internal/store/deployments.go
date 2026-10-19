@@ -289,3 +289,58 @@ func (s *Store) TrimReleases(ctx context.Context, projectID string, keep int) er
 	}
 	return nil
 }
+
+// InterruptedDeployments lists deployments still marked running. At startup
+// nothing is running yet, so every one of them was cut off by a restart.
+func (s *Store) InterruptedDeployments(ctx context.Context) ([]Deployment, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,project_id,COALESCE(release_id,''),operation_id FROM deployments WHERE status='running'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Deployment{}
+	for rows.Next() {
+		var item Deployment
+		if err := rows.Scan(&item.ID, &item.ProjectID, &item.ReleaseID, &item.OperationID); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ReleaseServesTraffic reports whether a release's containers were switched
+// in, which is the point after which it, not its predecessor, is running.
+func (s *Store) ReleaseServesTraffic(ctx context.Context, releaseID string) (bool, error) {
+	var count int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_containers WHERE release_id=? AND active=1`, releaseID).Scan(&count)
+	return count > 0, err
+}
+
+// FailRunningOperations marks operations a restart interrupted as failed, so
+// they stop reading as in progress forever.
+func (s *Store) FailRunningOperations(ctx context.Context, message string) (int64, error) {
+	result, err := s.DB.ExecContext(ctx, `UPDATE operations SET status='failed',progress=0,error=?,completed_at=? WHERE status='running'`, message, Now())
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// HostnameOwners maps each of hostnames already routed to another project to
+// that project's slug.
+func (s *Store) HostnameOwners(ctx context.Context, projectID string, hostnames []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, hostname := range hostnames {
+		var slug string
+		err := s.DB.QueryRowContext(ctx, `SELECT p.slug FROM routes r JOIN projects p ON p.id=r.project_id WHERE r.hostname=? AND r.project_id<>?`, hostname, projectID).Scan(&slug)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[hostname] = slug
+	}
+	return out, nil
+}

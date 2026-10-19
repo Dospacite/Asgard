@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,6 +98,20 @@ func (s *Service) ResetPassword(ctx context.Context, username, password string) 
 	return nil
 }
 
+var decoy struct {
+	once sync.Once
+	hash string
+}
+
+// decoyHash is a real password hash nobody knows the password to.
+func decoyHash() string {
+	decoy.once.Do(func() {
+		secret, _ := randomToken(32)
+		decoy.hash, _ = HashPassword(secret)
+	})
+	return decoy.hash
+}
+
 func (s *Service) CountUsers(ctx context.Context) (int, error) {
 	var count int
 	err := s.store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
@@ -108,7 +123,13 @@ func (s *Service) Authenticate(ctx context.Context, username, password string) (
 	var hash, created string
 	var last sql.NullString
 	err := s.store.DB.QueryRowContext(ctx, `SELECT id,username,password_hash,created_at,last_login_at FROM users WHERE username=? COLLATE NOCASE`, strings.TrimSpace(username)).Scan(&user.ID, &user.Username, &hash, &created, &last)
-	if err != nil || !VerifyPassword(hash, password) {
+	if err != nil {
+		// Spend the same hashing time as a wrong password, so response time
+		// does not reveal which usernames exist.
+		VerifyPassword(decoyHash(), password)
+		return User{}, errors.New("invalid username or password")
+	}
+	if !VerifyPassword(hash, password) {
 		return User{}, errors.New("invalid username or password")
 	}
 	user.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)

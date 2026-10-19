@@ -1,6 +1,9 @@
 package deploy
 
 import (
+	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rousoftware/asgard/internal/store"
@@ -57,5 +60,34 @@ func TestReleaseSummaryNamesWhatWasRecreated(t *testing.T) {
 		if got := releaseSummary(7, services, kept); got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
+	}
+}
+
+func TestCheckHostnamesRefusesTakenAndDuplicateNames(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "asgard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	now := store.Now()
+	for _, query := range []string{
+		`INSERT INTO projects(id,slug,name,source_type,source_path,created_at,updated_at) VALUES('other','other','Other','git','/x','` + now + `','` + now + `')`,
+		`INSERT INTO services(id,project_id,name,created_at,updated_at) VALUES('s','other','web','` + now + `','` + now + `')`,
+		`INSERT INTO routes(id,project_id,service_id,hostname,target_port,created_at,updated_at) VALUES('r','other','s','taken.example.com',80,'` + now + `','` + now + `')`,
+	} {
+		if _, err := database.DB.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deployer := &Deployer{Store: database}
+	if err := deployer.checkHostnames(ctx, "mine", []store.Service{{Name: "web", Public: true, Hostname: "taken.example.com"}}); err == nil || !strings.Contains(err.Error(), "project other") {
+		t.Fatalf("taken hostname: err = %v", err)
+	}
+	if err := deployer.checkHostnames(ctx, "mine", []store.Service{{Name: "a", Public: true, Hostname: "dup.example.com"}, {Name: "b", Public: true, Hostname: "dup.example.com"}}); err == nil {
+		t.Fatal("duplicate hostname accepted")
+	}
+	if err := deployer.checkHostnames(ctx, "other", []store.Service{{Name: "web", Public: true, Hostname: "taken.example.com"}}); err != nil {
+		t.Fatalf("own hostname refused: %v", err)
 	}
 }

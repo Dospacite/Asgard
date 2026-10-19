@@ -35,6 +35,7 @@ type App struct {
 	Operations *operations.Manager
 	API        *api.Server
 	proxy      *proxy.Generator
+	deployer   *deploy.Deployer
 	collector  *dockerx.Collector
 	sweeper    *reclaim.Sweeper
 	shipper    *logship.Shipper
@@ -84,7 +85,7 @@ func New(cfg config.Config) (*App, error) {
 	collector := &dockerx.Collector{Engine: engine, Store: database, Interval: cfg.MetricsInterval}
 	shipper := &logship.Shipper{Docker: engine, Store: database, Sink: cfg.LogSinkURL, Interval: cfg.LogShipInterval, Lookback: cfg.LogShipLookback, BatchBytes: cfg.LogShipBatchBytes}
 	verifier := &importer.Verifier{Importer: projectImporter, Interval: cfg.CredentialVerifyInterval}
-	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, proxy: proxyGenerator, collector: collector, verifier: verifier, sweeper: sweeper, shipper: shipper}, nil
+	return &App{Config: cfg, Store: database, Auth: authService, Docker: engine, Networks: networkManager, Operations: ops, API: server, proxy: proxyGenerator, deployer: deployer, collector: collector, verifier: verifier, sweeper: sweeper, shipper: shipper}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -99,6 +100,16 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.proxy.Write(ctx); err != nil {
 		slog.Warn("router configuration could not be regenerated", "error", err)
 	}
+	// Settle what a previous run was doing when it stopped, before anything
+	// new starts.
+	if err := a.deployer.RecoverInterrupted(ctx, func(message string, args ...any) { slog.Warn(message, args...) }); err != nil {
+		slog.Warn("interrupted deployments could not be fully recovered", "error", err)
+	}
+	if count, err := a.Store.FailRunningOperations(ctx, deploy.InterruptedMessage); err != nil {
+		slog.Warn("interrupted operations could not be settled", "error", err)
+	} else if count > 0 {
+		slog.Warn("settled operations a restart interrupted", "count", count)
+	}
 	if err := a.Operations.Start(ctx); err != nil {
 		return err
 	}
@@ -112,6 +123,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.sweeper.Start(ctx)
 	// ASGARD_LOG_SINK_URL="" leaves log collection to the operator.
 	a.shipper.Start(ctx)
+	go a.pruneLoop(ctx)
 	a.http = &http.Server{Addr: a.Config.ListenAddr, Handler: a.API.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
 	errCh := make(chan error, 1)
 	go func() {
@@ -134,6 +146,26 @@ func (a *App) Run(ctx context.Context) error {
 			return nil
 		}
 		return err
+	}
+}
+
+// pruneLoop removes spent credentials and old operation logs at startup and
+// then hourly, so the database stays the size of what is still in use.
+func (a *App) pruneLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		result, err := a.Store.Prune(ctx, time.Now())
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("database pruning failed", "error", err)
+		} else if result.Sessions+result.OAuthCodes+result.OAuthTokens+result.OperationLogs > 0 {
+			slog.Info("pruned spent rows", "sessions", result.Sessions, "oauth_codes", result.OAuthCodes, "oauth_tokens", result.OAuthTokens, "operation_logs", result.OperationLogs)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

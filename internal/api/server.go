@@ -231,6 +231,13 @@ func (l *loginLimiter) fail(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
+	// Forget addresses whose window and block have both lapsed, so the map
+	// stays the size of the addresses currently failing.
+	for other, stale := range l.entries {
+		if now.Sub(stale.window) > 15*time.Minute && now.After(stale.blockedUntil) {
+			delete(l.entries, other)
+		}
+	}
 	entry := l.entries[key]
 	if entry == nil || now.Sub(entry.window) > 15*time.Minute {
 		entry = &loginAttempt{window: now}

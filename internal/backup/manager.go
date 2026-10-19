@@ -47,12 +47,17 @@ func (m *Manager) HandleRestore(ctx context.Context, op store.Operation) error {
 	if p.BackupID == "" {
 		return errors.New("backupId is required")
 	}
-	var sourcePath, volumeID, status string
-	if err := m.Store.DB.QueryRowContext(ctx, `SELECT path,volume_id,status FROM backups WHERE id=?`, p.BackupID).Scan(&sourcePath, &volumeID, &status); err != nil {
+	var sourcePath, volumeID, status, checksum string
+	if err := m.Store.DB.QueryRowContext(ctx, `SELECT path,volume_id,status,COALESCE(sha256,'') FROM backups WHERE id=?`, p.BackupID).Scan(&sourcePath, &volumeID, &status, &checksum); err != nil {
 		return err
 	}
 	if status != "succeeded" {
 		return errors.New("only a successful backup can be restored")
+	}
+	// The restore empties the volume before unpacking, so a damaged archive
+	// would leave it empty. Prove the file is the one that was written first.
+	if err := verifyChecksum(sourcePath, checksum); err != nil {
+		return err
 	}
 	p.VolumeID = volumeID
 	info, err := m.volume(ctx, p.VolumeID)
@@ -74,12 +79,36 @@ func (m *Manager) HandleRestore(ctx context.Context, op store.Operation) error {
 	if err != nil || strings.HasPrefix(relative, "..") {
 		return errors.New("backup path is outside the managed backup directory")
 	}
-	script := fmt.Sprintf("set -eu; find /volume -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar -xzf %s -C /volume", shellQuote(filepath.ToSlash(filepath.Join("/asgard-data/backups", relative))))
+	archive := shellQuote(filepath.ToSlash(filepath.Join("/asgard-data/backups", relative)))
+	// Read the whole archive once before deleting anything, so a file that
+	// cannot be unpacked fails the restore with the volume untouched.
+	script := fmt.Sprintf("set -eu; tar -tzf %s >/dev/null; find /volume -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar -xzf %s -C /volume", archive, archive)
 	mounts := []mount.Mount{{Type: mount.TypeVolume, Source: info.Name, Target: "/volume"}, {Type: mount.TypeVolume, Source: m.DataVolume, Target: "/asgard-data", ReadOnly: true}}
 	if err = m.Docker.RunHelper(ctx, m.HelperImage, "asgard-restore-"+op.ID[:8], script, mounts, func(line string) { _ = m.Store.LogOperation(ctx, op.ID, "info", line) }); err != nil {
 		return err
 	}
 	_ = m.Store.ProgressOperation(ctx, op.ID, 90, "Volume restored; restarting services")
+	return nil
+}
+
+// verifyChecksum compares a backup file with the digest recorded when it was
+// written. A backup recorded before digests existed has none to compare.
+func verifyChecksum(path, want string) error {
+	if want == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open backup: %w", err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return fmt.Errorf("read backup: %w", err)
+	}
+	if got := hex.EncodeToString(hash.Sum(nil)); got != want {
+		return fmt.Errorf("backup file does not match the checksum recorded when it was written (%s, want %s); the volume was left untouched", got, want)
+	}
 	return nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -186,10 +187,21 @@ func (s *Server) importImage(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"project": project, "validation": result})
 }
 
+// archiveUploadTimeout bounds one archive upload. The server's own read
+// timeout is 30 seconds, which a 100 MiB archive only meets above 3 MiB/s, so
+// an upload from a slow link was cut off and reported as too large.
+const archiveUploadTimeout = 30 * time.Minute
+
 func (s *Server) importArchive(w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(archiveUploadTimeout))
 	r.Body = http.MaxBytesReader(w, r.Body, importer.MaxArchiveCompressed+2<<20)
 	if err := r.ParseMultipartForm(importer.MaxArchiveCompressed + 1<<20); err != nil {
-		httpx.Error(w, http.StatusRequestEntityTooLarge, "upload_too_large", "Archive uploads are limited to 100 MiB.")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "upload_too_large", "Archive uploads are limited to 100 MiB.")
+			return
+		}
+		httpx.Error(w, http.StatusBadRequest, "upload_incomplete", "The archive upload did not complete: "+err.Error())
 		return
 	}
 	file, header, err := r.FormFile("file")
