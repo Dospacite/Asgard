@@ -3,9 +3,12 @@ package reclaim
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/rousoftware/asgard/internal/dockerx"
+	"github.com/rousoftware/asgard/internal/store"
 )
 
 func TestParseReleaseTag(t *testing.T) {
@@ -159,4 +162,40 @@ func TestRunSkipsWhileABuildIsHeld(t *testing.T) {
 	second := base.HoldBuilds()
 	second()
 	release()
+}
+
+// A container left running from an old release — a database nobody redeploys —
+// must not keep that whole release's images. Its own image is protected as an
+// in-use image; the release's other images age out like any other.
+func TestProtectedVersionsKeepsOnlyTheNewestReleases(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "asgard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	now := store.Now()
+	queries := []string{
+		`INSERT INTO projects(id,slug,name,source_type,source_path,created_at,updated_at) VALUES('p','flobby','Flobby','git','/x','` + now + `','` + now + `')`,
+		`INSERT INTO services(id,project_id,name,created_at,updated_at) VALUES('redis','p','redis','` + now + `','` + now + `')`,
+	}
+	for version := 1; version <= 5; version++ {
+		v := strconv.Itoa(version)
+		queries = append(queries, `INSERT INTO releases(id,project_id,version,status,compose_snapshot,created_at) VALUES('r`+v+`','p',`+v+`,'succeeded','','`+now+`')`)
+	}
+	queries = append(queries, `INSERT INTO runtime_containers(id,project_id,service_id,release_id,docker_id,docker_name,active,created_at,updated_at) VALUES('c','p','redis','r1','d','asgard-flobby-redis-r1',1,'`+now+`','`+now+`')`)
+	for _, query := range queries {
+		if _, err := database.DB.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep, err := (&Reclaimer{Store: database, Policy: Policy{KeepReleases: 3}}).protectedVersions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version, want := range map[int]bool{1: false, 2: false, 3: true, 4: true, 5: true} {
+		if got := keep.has("flobby", version); got != want {
+			t.Errorf("r%d protected = %v, want %v", version, got, want)
+		}
+	}
 }

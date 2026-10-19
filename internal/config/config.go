@@ -37,6 +37,7 @@ type Config struct {
 	KeepReleaseImages int
 	BuildCacheBytes   int64
 	BuildConcurrency  int
+	MinFreeDiskBytes  int64
 	ReclaimInterval   time.Duration
 	// Log shipping to a collector that accepts a Loki push API. An empty sink
 	// disables it: an install with no collector should not keep checkpoints for
@@ -86,9 +87,14 @@ func Load() (Config, error) {
 	if err != nil || keepImages < 1 || keepImages > 50 {
 		return Config{}, errors.New("ASGARD_KEEP_RELEASE_IMAGES must be between 1 and 50")
 	}
-	cacheGB, err := envInt("ASGARD_BUILD_CACHE_GB", 10)
+	// The budget counts only cache no image shares; see PruneBuildCache.
+	cacheGB, err := envInt("ASGARD_BUILD_CACHE_GB", 5)
 	if err != nil || cacheGB < 0 || cacheGB > 500 {
 		return Config{}, errors.New("ASGARD_BUILD_CACHE_GB must be between 0 and 500")
+	}
+	minFreeGB, err := envInt("ASGARD_MIN_FREE_DISK_GB", 10)
+	if err != nil || minFreeGB < 0 || minFreeGB > 1000 {
+		return Config{}, errors.New("ASGARD_MIN_FREE_DISK_GB must be between 0 and 1000")
 	}
 	// How many of a release's images build at once. Builds are CPU- and
 	// memory-heavy, so the default suits a small host.
@@ -133,6 +139,7 @@ func Load() (Config, error) {
 		KeepReleaseImages:        keepImages,
 		BuildCacheBytes:          int64(cacheGB) << 30,
 		BuildConcurrency:         buildConcurrency,
+		MinFreeDiskBytes:         int64(minFreeGB) << 30,
 		ReclaimInterval:          time.Duration(reclaimHours) * time.Hour,
 		LogSinkURL:               strings.TrimSpace(os.Getenv("ASGARD_LOG_SINK_URL")),
 		LogShipInterval:          time.Duration(logInterval) * time.Second,

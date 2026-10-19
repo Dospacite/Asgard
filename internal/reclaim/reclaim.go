@@ -40,6 +40,9 @@ type Policy struct {
 	KeepReleases int
 	// BuildCacheBytes caps the builder cache. Zero disables cache pruning.
 	BuildCacheBytes int64
+	// MinFreeBytes makes cache pruning go below BuildCacheBytes while the
+	// disk has less free space than this.
+	MinFreeBytes int64
 	// DryRun reports what would be removed without removing it.
 	DryRun bool
 }
@@ -162,9 +165,14 @@ func (k keepSet) knownSlug(slug string) bool {
 }
 
 // protectedVersions computes, per project slug, the release versions whose
-// images must be kept: the newest KeepReleases releases plus whatever any
-// active container is actually running. A project with no releases yet still
-// appears, so its slug is not mistaken for an orphan.
+// images are kept for rollback: the newest KeepReleases releases. A project
+// with no releases yet still appears, so its slug is not mistaken for an
+// orphan.
+//
+// What is running is protected image by image, through inUseImages, and not
+// here. Protecting a whole release because one of its containers still runs
+// kept every image that release built: a redis container left untouched since
+// r8 held on to r8's backend and web images, which nothing used.
 func (r *Reclaimer) protectedVersions(ctx context.Context) (keepSet, error) {
 	keep := keepSet{}
 	rows, err := r.Store.DB.QueryContext(ctx, `SELECT id,slug FROM projects`)
@@ -202,22 +210,6 @@ func (r *Reclaimer) protectedVersions(ctx context.Context) (keepSet, error) {
 			keep[p.slug][version] = true
 		}
 		versionRows.Close()
-		// Anything currently running is protected regardless of age. A project
-		// that has not been redeployed in a long time must never have the
-		// image out from under its running container.
-		activeRows, err := r.Store.DB.QueryContext(ctx, `SELECT DISTINCT rel.version FROM runtime_containers rc JOIN releases rel ON rel.id=rc.release_id WHERE rc.project_id=? AND rc.active=1`, p.id)
-		if err != nil {
-			return nil, err
-		}
-		for activeRows.Next() {
-			var version int
-			if err := activeRows.Scan(&version); err != nil {
-				activeRows.Close()
-				return nil, err
-			}
-			keep[p.slug][version] = true
-		}
-		activeRows.Close()
 	}
 	return keep, nil
 }
@@ -304,7 +296,7 @@ func (r *Reclaimer) Run(ctx context.Context) (Result, error) {
 	}
 
 	if r.Policy.BuildCacheBytes > 0 && !r.Policy.DryRun {
-		reclaimed, err := r.Docker.PruneBuildCache(ctx, r.Policy.BuildCacheBytes)
+		reclaimed, err := r.Docker.PruneBuildCache(ctx, r.Policy.BuildCacheBytes, r.Policy.MinFreeBytes)
 		if err != nil {
 			r.logger().Warn("build cache could not be pruned", "error", err)
 			result.Errors++

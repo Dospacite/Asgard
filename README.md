@@ -164,7 +164,8 @@ Edit `deploy/.env`:
 | `ASGARD_SECURE_COOKIES` | Leave `true` for any real deployment |
 | `ASGARD_CREDENTIAL_VERIFY_HOURS` | How often stored Git credentials are re-proven (default `6`, `0` disables) |
 | `ASGARD_KEEP_RELEASE_IMAGES` | Releases whose images are kept — also how far back a rollback can reach (default `3`) |
-| `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `10`, `0` disables cache pruning) |
+| `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `5`, `0` disables cache pruning). It counts only cache no image shares, so `docker system df` shows more |
+| `ASGARD_MIN_FREE_DISK_GB` | Free disk below which the build cache is pruned past its budget (default `10`, `0` disables) |
 | `ASGARD_BUILD_CONCURRENCY` | How many of a release's images build at once (default `2`) |
 | `ASGARD_RECLAIM_HOURS` | How often disk is reclaimed (default `12`, `0` disables) |
 | `ASGARD_GRAFANA_HOSTNAME` | Hostname of the log collector's UI, e.g. `grafana.apps.example.com` |
@@ -485,10 +486,14 @@ up. Asgard reclaims what it created, and only what it created:
 - Images from releases past `ASGARD_KEEP_RELEASE_IMAGES`.
 - Every image of a project that has been deleted.
 - Untagged layers left behind by rebuilds.
-- Build cache over `ASGARD_BUILD_CACHE_GB`.
+- Build cache over `ASGARD_BUILD_CACHE_GB`, and further while free disk is
+  under `ASGARD_MIN_FREE_DISK_GB`. The budget counts only cache that no image
+  shares; the rest is freed with the images that hold it.
 
-Images backing the most recent releases, and any image a container still
-references, are never removed — retention is what bounds how far back a rollback
+Images backing the most recent releases, and the exact image each container
+still references, are never removed. An older release is not kept whole just
+because one of its services was never redeployed: its other images go once they
+age out — retention is what bounds how far back a rollback
 can reach, which is why the floor is one release rather than zero. Upstream
 images a project pulls are shared and never touched.
 

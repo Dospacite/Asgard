@@ -76,14 +76,17 @@ func (e *Engine) RemoveImage(ctx context.Context, ref string) error {
 // state — but nothing bounds it, so it grows until the disk is the limit. A
 // budget keeps the speed benefit for recent builds while capping the cost;
 // pruning it to nothing would make every subsequent build a cold one.
-func (e *Engine) PruneBuildCache(ctx context.Context, keepBytes int64) (int64, error) {
-	if keepBytes < 0 {
-		keepBytes = 0
-	}
-	// MaxUsedSpace caps total cache usage; the daemon evicts least-recently-used
-	// entries down to it. All:false leaves cache still referenced by an image
-	// alone, so a rebuild of an unchanged layer stays a cache hit.
-	result, err := e.client.BuildCachePrune(ctx, client.BuildCachePruneOptions{MaxUsedSpace: keepBytes})
+//
+// BuildKit measures keepBytes against the cache it holds privately, not the
+// figure `docker system df` reports: layers an image also holds are counted
+// there but freed only when the image goes. minFreeBytes makes the daemon
+// evict further, below the budget, while the disk has less free space than
+// that.
+func (e *Engine) PruneBuildCache(ctx context.Context, keepBytes, minFreeBytes int64) (int64, error) {
+	keepBytes, minFreeBytes = max(keepBytes, 0), max(minFreeBytes, 0)
+	// The daemon evicts least-recently-used entries. All:false leaves cache an
+	// image still shares alone, so a rebuild of an unchanged layer stays a hit.
+	result, err := e.client.BuildCachePrune(ctx, client.BuildCachePruneOptions{MaxUsedSpace: keepBytes, MinFreeSpace: minFreeBytes})
 	if err != nil {
 		return 0, err
 	}

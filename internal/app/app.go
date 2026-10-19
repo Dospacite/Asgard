@@ -75,7 +75,7 @@ func New(cfg config.Config) (*App, error) {
 	}
 	projectImporter := &importer.Importer{Store: database, ProjectsDir: cfg.ProjectsDir, DataDir: cfg.DataDir, Domain: cfg.Domain, Secrets: secretBox}
 	networkManager := &networking.Manager{Store: database, Docker: engine, EdgeNetwork: cfg.EdgeNetwork}
-	reclaimer := &reclaim.Reclaimer{Store: database, Docker: engine, Policy: reclaim.Policy{KeepReleases: cfg.KeepReleaseImages, BuildCacheBytes: cfg.BuildCacheBytes}}
+	reclaimer := &reclaim.Reclaimer{Store: database, Docker: engine, Policy: reclaim.Policy{KeepReleases: cfg.KeepReleaseImages, BuildCacheBytes: cfg.BuildCacheBytes, MinFreeBytes: cfg.MinFreeDiskBytes}}
 	sweeper := &reclaim.Sweeper{Reclaimer: reclaimer, Interval: cfg.ReclaimInterval}
 	deployer.Reclaimer = reclaimer
 
