@@ -81,9 +81,10 @@ func Load() (Config, error) {
 		return Config{}, errors.New("ASGARD_CREDENTIAL_VERIFY_HOURS must be between 0 and 168")
 	}
 	verifyInterval := time.Duration(verifyHours) * time.Hour
-	// How many releases keep their images. This is how far back a rollback can
-	// reach, so the floor is 1 rather than 0.
-	keepImages, err := envInt("ASGARD_KEEP_RELEASE_IMAGES", 3)
+	// How many successful releases keep their images, counting the live one.
+	// The default of 2 keeps the live release and the previous one, which is
+	// what a rollback needs. The floor is 1: the live release itself.
+	keepImages, err := envInt("ASGARD_KEEP_RELEASE_IMAGES", 2)
 	if err != nil || keepImages < 1 || keepImages > 50 {
 		return Config{}, errors.New("ASGARD_KEEP_RELEASE_IMAGES must be between 1 and 50")
 	}

@@ -164,10 +164,13 @@ func TestRunSkipsWhileABuildIsHeld(t *testing.T) {
 	release()
 }
 
-// A container left running from an old release — a database nobody redeploys —
-// must not keep that whole release's images. Its own image is protected as an
-// in-use image; the release's other images age out like any other.
-func TestProtectedVersionsKeepsOnlyTheNewestReleases(t *testing.T) {
+// Retention keeps the live release and the one before it. A failed release can
+// never be rolled back to, so it keeps nothing and does not push the previous
+// release out; a release still deploying keeps the images it is about to
+// start. A container left running from an old release — a database nobody
+// redeploys — does not keep that whole release: its own image is protected as
+// an in-use image, and the release's other images age out.
+func TestProtectedVersionsKeepsTheLiveAndPreviousReleases(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "asgard.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -179,9 +182,10 @@ func TestProtectedVersionsKeepsOnlyTheNewestReleases(t *testing.T) {
 		`INSERT INTO projects(id,slug,name,source_type,source_path,created_at,updated_at) VALUES('p','flobby','Flobby','git','/x','` + now + `','` + now + `')`,
 		`INSERT INTO services(id,project_id,name,created_at,updated_at) VALUES('redis','p','redis','` + now + `','` + now + `')`,
 	}
-	for version := 1; version <= 5; version++ {
+	statuses := map[int]string{1: "succeeded", 2: "succeeded", 3: "succeeded", 4: "succeeded", 5: "failed", 6: "deploying"}
+	for version, status := range statuses {
 		v := strconv.Itoa(version)
-		queries = append(queries, `INSERT INTO releases(id,project_id,version,status,compose_snapshot,created_at) VALUES('r`+v+`','p',`+v+`,'succeeded','','`+now+`')`)
+		queries = append(queries, `INSERT INTO releases(id,project_id,version,status,compose_snapshot,created_at) VALUES('r`+v+`','p',`+v+`,'`+status+`','','`+now+`')`)
 	}
 	queries = append(queries, `INSERT INTO runtime_containers(id,project_id,service_id,release_id,docker_id,docker_name,active,created_at,updated_at) VALUES('c','p','redis','r1','d','asgard-flobby-redis-r1',1,'`+now+`','`+now+`')`)
 	for _, query := range queries {
@@ -189,13 +193,13 @@ func TestProtectedVersionsKeepsOnlyTheNewestReleases(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	keep, err := (&Reclaimer{Store: database, Policy: Policy{KeepReleases: 3}}).protectedVersions(ctx)
+	keep, err := (&Reclaimer{Store: database, Policy: Policy{KeepReleases: 2}}).protectedVersions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for version, want := range map[int]bool{1: false, 2: false, 3: true, 4: true, 5: true} {
+	for version, want := range map[int]bool{1: false, 2: false, 3: true, 4: true, 5: false, 6: true} {
 		if got := keep.has("flobby", version); got != want {
-			t.Errorf("r%d protected = %v, want %v", version, got, want)
+			t.Errorf("r%d (%s) protected = %v, want %v", version, statuses[version], got, want)
 		}
 	}
 }

@@ -165,9 +165,12 @@ func (k keepSet) knownSlug(slug string) bool {
 }
 
 // protectedVersions computes, per project slug, the release versions whose
-// images are kept for rollback: the newest KeepReleases releases. A project
-// with no releases yet still appears, so its slug is not mistaken for an
-// orphan.
+// images are kept: the newest KeepReleases successful releases, which are the
+// live one and the rollback targets behind it, plus any release still
+// deploying, whose freshly built images are about to be started. A failed
+// release keeps nothing — it can never be a rollback target, and counting it
+// would push out the release a rollback needs. A project with no releases yet
+// still appears, so its slug is not mistaken for an orphan.
 //
 // What is running is protected image by image, through inUseImages, and not
 // here. Protecting a whole release because one of its containers still runs
@@ -194,10 +197,7 @@ func (r *Reclaimer) protectedVersions(ctx context.Context) (keepSet, error) {
 	}
 	for _, p := range projects {
 		keep[p.slug] = map[int]bool{}
-		// The newest releases, whatever their status. A failed release still
-		// holds the images a retry would reuse, and counting only successful
-		// ones would quietly discard the version an operator is debugging.
-		versionRows, err := r.Store.DB.QueryContext(ctx, `SELECT version FROM releases WHERE project_id=? ORDER BY version DESC LIMIT ?`, p.id, r.keepReleases())
+		versionRows, err := r.Store.DB.QueryContext(ctx, `SELECT version FROM releases WHERE project_id=? AND (status NOT IN ('succeeded','failed') OR version IN (SELECT version FROM releases WHERE project_id=? AND status='succeeded' ORDER BY version DESC LIMIT ?))`, p.id, p.id, r.keepReleases())
 		if err != nil {
 			return nil, err
 		}

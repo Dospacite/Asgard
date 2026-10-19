@@ -163,7 +163,7 @@ Edit `deploy/.env`:
 | `ASGARD_TIMEZONE` | IANA timezone used for displayed timestamps |
 | `ASGARD_SECURE_COOKIES` | Leave `true` for any real deployment |
 | `ASGARD_CREDENTIAL_VERIFY_HOURS` | How often stored Git credentials are re-proven (default `6`, `0` disables) |
-| `ASGARD_KEEP_RELEASE_IMAGES` | Releases whose images are kept — also how far back a rollback can reach (default `3`) |
+| `ASGARD_KEEP_RELEASE_IMAGES` | Successful releases whose images are kept, counting the live one — also how far back a rollback can reach (default `2`: the live release and the previous one) |
 | `ASGARD_BUILD_CACHE_GB` | Build cache budget (default `5`, `0` disables cache pruning). It counts only cache no image shares, so `docker system df` shows more |
 | `ASGARD_MIN_FREE_DISK_GB` | Free disk below which the build cache is pruned past its budget (default `10`, `0` disables) |
 | `ASGARD_BUILD_CONCURRENCY` | How many of a release's images build at once (default `2`) |
@@ -483,7 +483,8 @@ Asgard builds one image per service per release (`asgard/<slug>/<service>:r<n>`)
 and Docker caches every build layer, so a host that only ever deploys will fill
 up. Asgard reclaims what it created, and only what it created:
 
-- Images from releases past `ASGARD_KEEP_RELEASE_IMAGES`.
+- Images from successful releases past `ASGARD_KEEP_RELEASE_IMAGES`, and from
+  every failed release, which can never be rolled back to.
 - Every image of a project that has been deleted.
 - Untagged layers left behind by rebuilds.
 - Build cache over `ASGARD_BUILD_CACHE_GB`, and further while free disk is
